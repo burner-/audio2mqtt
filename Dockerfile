@@ -46,7 +46,7 @@ WORKDIR /app
 COPY --from=builder /app/target/release/audio2mqtt /usr/local/bin/audio2mqtt
 COPY static ./static
 COPY entrypoint.sh /entrypoint.sh
-RUN chmod +x /entrypoint.sh
+RUN sed -i 's/\r$//' /entrypoint.sh && chmod +x /entrypoint.sh
 
 EXPOSE 15000 8080
 ENTRYPOINT ["/entrypoint.sh"]
