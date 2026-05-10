@@ -113,6 +113,8 @@ struct RuntimeConfig {
     models: ModelConfig,
     #[serde(default)]
     logging: LoggingConfig,
+    #[serde(default)]
+    transcription: TranscriptionConfig,
 }
 
 impl Default for RuntimeConfig {
@@ -122,6 +124,22 @@ impl Default for RuntimeConfig {
             webhooks: vec![],
             models: ModelConfig::default(),
             logging: LoggingConfig::default(),
+            transcription: TranscriptionConfig::default(),
+        }
+    }
+}
+
+impl RuntimeConfig {
+    fn from_env(env: &EnvConfig) -> Self {
+        Self {
+            mqtt: MqttConfig::default(),
+            webhooks: vec![],
+            models: ModelConfig {
+                active_model_id: env.default_model_id.clone(),
+                profiles: default_model_profiles(&env.default_model_id, &env.model_path, &env.model_url),
+            },
+            logging: LoggingConfig::default(),
+            transcription: TranscriptionConfig::from_env(env),
         }
     }
 }
@@ -144,6 +162,131 @@ impl Default for LoggingConfig {
             level: "info".to_string(),
             vad_debug: false,
         }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct TranscriptionConfig {
+    #[serde(default = "default_language")]
+    language: String,
+    #[serde(default = "default_n_threads")]
+    n_threads: i32,
+    #[serde(default = "default_beam_size")]
+    beam_size: i32,
+    #[serde(default = "default_vad_threshold")]
+    vad_threshold: f32,
+    #[serde(default = "default_min_segment_seconds")]
+    min_segment_seconds: f64,
+    #[serde(default = "default_max_segment_seconds")]
+    max_segment_seconds: f64,
+    #[serde(default = "default_silence_cut_seconds")]
+    silence_cut_seconds: f64,
+    #[serde(default = "default_pre_roll_seconds")]
+    pre_roll_seconds: f64,
+}
+
+fn default_language() -> String {
+    "fi".to_string()
+}
+
+fn default_n_threads() -> i32 {
+    8
+}
+
+fn default_beam_size() -> i32 {
+    3
+}
+
+fn default_vad_threshold() -> f32 {
+    0.55
+}
+
+fn default_min_segment_seconds() -> f64 {
+    1.0
+}
+
+fn default_max_segment_seconds() -> f64 {
+    30.0
+}
+
+fn default_silence_cut_seconds() -> f64 {
+    1.2
+}
+
+fn default_pre_roll_seconds() -> f64 {
+    0.4
+}
+
+impl Default for TranscriptionConfig {
+    fn default() -> Self {
+        Self {
+            language: default_language(),
+            n_threads: default_n_threads(),
+            beam_size: default_beam_size(),
+            vad_threshold: default_vad_threshold(),
+            min_segment_seconds: default_min_segment_seconds(),
+            max_segment_seconds: default_max_segment_seconds(),
+            silence_cut_seconds: default_silence_cut_seconds(),
+            pre_roll_seconds: default_pre_roll_seconds(),
+        }
+    }
+}
+
+impl TranscriptionConfig {
+    fn from_env(env: &EnvConfig) -> Self {
+        Self {
+            language: env.language.clone(),
+            n_threads: env.n_threads,
+            beam_size: env.beam_size,
+            vad_threshold: env.vad_threshold,
+            min_segment_seconds: env.min_segment_seconds,
+            max_segment_seconds: env.max_segment_seconds,
+            silence_cut_seconds: env.silence_cut_seconds,
+            pre_roll_seconds: env.pre_roll_seconds,
+        }
+        .normalized()
+    }
+
+    fn normalized(&self) -> Self {
+        let language = if self.language.trim().is_empty() {
+            default_language()
+        } else {
+            self.language.trim().to_string()
+        };
+        let n_threads = self.n_threads.max(1);
+        let beam_size = self.beam_size.max(1);
+        let vad_threshold = finite_f32_or(self.vad_threshold, default_vad_threshold()).clamp(0.0, 1.0);
+        let min_segment_seconds = finite_f64_or(self.min_segment_seconds, default_min_segment_seconds()).max(0.1);
+        let max_segment_seconds = finite_f64_or(self.max_segment_seconds, default_max_segment_seconds()).max(min_segment_seconds);
+        let silence_cut_seconds = finite_f64_or(self.silence_cut_seconds, default_silence_cut_seconds()).max(0.05);
+        let pre_roll_seconds = finite_f64_or(self.pre_roll_seconds, default_pre_roll_seconds()).max(0.0);
+
+        Self {
+            language,
+            n_threads,
+            beam_size,
+            vad_threshold,
+            min_segment_seconds,
+            max_segment_seconds,
+            silence_cut_seconds,
+            pre_roll_seconds,
+        }
+    }
+}
+
+fn finite_f32_or(value: f32, fallback: f32) -> f32 {
+    if value.is_finite() {
+        value
+    } else {
+        fallback
+    }
+}
+
+fn finite_f64_or(value: f64, fallback: f64) -> f64 {
+    if value.is_finite() {
+        value
+    } else {
+        fallback
     }
 }
 
@@ -207,7 +350,9 @@ struct ModelProfile {
     name: String,
     path: String,
     url: String,
+    #[serde(default)]
     description: String,
+    #[serde(default)]
     recommended_vram_gb: Option<u32>,
 }
 
@@ -221,6 +366,27 @@ struct ModelActivateRequest {
     id: String,
     #[serde(default = "default_true")]
     download_if_missing: bool,
+}
+
+#[derive(Debug, Deserialize)]
+struct HuggingFaceModelAddRequest {
+    repo_id: String,
+    filename: Option<String>,
+    id: Option<String>,
+    name: Option<String>,
+    #[serde(default)]
+    set_active: bool,
+}
+
+#[derive(Debug, Deserialize)]
+struct HuggingFaceModelInfo {
+    #[serde(default)]
+    siblings: Vec<HuggingFaceSibling>,
+}
+
+#[derive(Debug, Deserialize)]
+struct HuggingFaceSibling {
+    rfilename: String,
 }
 
 fn default_true() -> bool {
@@ -381,10 +547,25 @@ fn load_or_create_runtime_config(path: &str, env: &EnvConfig) -> Result<RuntimeC
     let mut changed = false;
     let mut cfg = if Path::new(path).exists() {
         let raw = fs::read_to_string(path).with_context(|| format!("reading {path}"))?;
-        serde_json::from_str(&raw).with_context(|| format!("parsing {path}"))?
+        let raw_value: Value = serde_json::from_str(&raw).with_context(|| format!("parsing {path}"))?;
+        let has_models = raw_value.get("models").is_some();
+        let has_transcription = raw_value.get("transcription").is_some();
+        let mut parsed: RuntimeConfig = serde_json::from_value(raw_value).with_context(|| format!("parsing {path}"))?;
+        if !has_models {
+            parsed.models = ModelConfig {
+                active_model_id: env.default_model_id.clone(),
+                profiles: default_model_profiles(&env.default_model_id, &env.model_path, &env.model_url),
+            };
+            changed = true;
+        }
+        if !has_transcription {
+            parsed.transcription = TranscriptionConfig::from_env(env);
+            changed = true;
+        }
+        parsed
     } else {
         changed = true;
-        RuntimeConfig::default()
+        RuntimeConfig::from_env(env)
     };
 
     if cfg.models.profiles.is_empty() {
@@ -394,6 +575,8 @@ fn load_or_create_runtime_config(path: &str, env: &EnvConfig) -> Result<RuntimeC
         };
         changed = true;
     }
+    cfg.transcription = cfg.transcription.normalized();
+    changed |= ensure_finnish_nlp_profile(&mut cfg.models.profiles);
 
     if cfg.models.active_model_id.trim().is_empty()
         || !cfg.models.profiles.iter().any(|p| p.id.as_str() == cfg.models.active_model_id.as_str())
@@ -412,6 +595,15 @@ fn load_or_create_runtime_config(path: &str, env: &EnvConfig) -> Result<RuntimeC
     }
 
     Ok(cfg)
+}
+
+fn ensure_finnish_nlp_profile(profiles: &mut Vec<ModelProfile>) -> bool {
+    let profile = finnish_nlp_large_v3_profile();
+    if profiles.iter().any(|p| p.id.as_str() == profile.id.as_str()) {
+        return false;
+    }
+    profiles.push(profile);
+    true
 }
 
 fn default_model_profiles(default_id: &str, default_path: &str, default_url: &str) -> Vec<ModelProfile> {
@@ -440,6 +632,7 @@ fn default_model_profiles(default_id: &str, default_path: &str, default_url: &st
             description: "Light fallback. Finnish accuracy is clearly weaker than large-v3.".to_string(),
             recommended_vram_gb: Some(5),
         },
+        finnish_nlp_large_v3_profile(),
     ];
 
     if !profiles.iter().any(|p| p.id.as_str() == default_id) {
@@ -457,6 +650,17 @@ fn default_model_profiles(default_id: &str, default_path: &str, default_url: &st
     }
 
     profiles
+}
+
+fn finnish_nlp_large_v3_profile() -> ModelProfile {
+    ModelProfile {
+        id: "finnish-nlp-large-v3".to_string(),
+        name: "Finnish-NLP Finnish Whisper large-v3".to_string(),
+        path: "/models/ggml-model-fi-large-v3.bin".to_string(),
+        url: "https://huggingface.co/Finnish-NLP/Finnish-finetuned-whisper-models-ggml-format/resolve/main/ggml-model-fi-large-v3.bin".to_string(),
+        description: "Finnish fine-tuned GGML large-v3 model from Finnish-NLP.".to_string(),
+        recommended_vram_gb: Some(10),
+    }
 }
 
 fn active_model_profile(cfg: &RuntimeConfig, env: &EnvConfig) -> ModelProfile {
@@ -499,9 +703,9 @@ fn start_transcriber_thread(
 
             while let Some(mut job) = job_rx.blocking_recv() {
                 let reply = job.reply.take();
-                let profile = {
+                let (profile, transcription) = {
                     let cfg = runtime_config.read().unwrap().clone();
-                    active_model_profile(&cfg, &env)
+                    (active_model_profile(&cfg, &env), cfg.transcription.normalized())
                 };
 
                 let must_reload = loaded_model_id.as_deref() != Some(profile.id.as_str())
@@ -542,7 +746,7 @@ fn start_transcriber_thread(
                 }
 
                 let start = Instant::now();
-                match transcribe_one(ctx.as_ref().expect("ctx loaded"), &env, &profile, job) {
+                match transcribe_one(ctx.as_ref().expect("ctx loaded"), &transcription, &profile, job) {
                     Ok(event) => {
                         let elapsed = start.elapsed().as_millis();
                         info!(id = %event.id, model_id = %profile.id, elapsed_ms = elapsed, text = %event.result.text, "transcribed segment");
@@ -566,16 +770,21 @@ fn start_transcriber_thread(
     Ok(())
 }
 
-fn transcribe_one(ctx: &WhisperContext, env: &EnvConfig, profile: &ModelProfile, job: TranscribeJob) -> Result<TranscriptEvent> {
+fn transcribe_one(
+    ctx: &WhisperContext,
+    transcription: &TranscriptionConfig,
+    profile: &ModelProfile,
+    job: TranscribeJob,
+) -> Result<TranscriptEvent> {
     let mut state = ctx.create_state()?;
     let mut params = FullParams::new(SamplingStrategy::BeamSearch {
-        beam_size: env.beam_size,
+        beam_size: transcription.beam_size,
         patience: -1.0,
     });
 
-    let language = env.language.clone();
+    let language = transcription.language.clone();
     params.set_language(Some(&language));
-    params.set_n_threads(env.n_threads);
+    params.set_n_threads(transcription.n_threads);
     params.set_translate(false);
     params.set_no_context(true);
     params.set_print_progress(false);
@@ -630,7 +839,7 @@ fn transcribe_one(ctx: &WhisperContext, env: &EnvConfig, profile: &ModelProfile,
         },
         vad: job.vad,
         result: TranscriptResult {
-            language: env.language.clone(),
+            language,
             text,
             segments,
         },
@@ -650,13 +859,12 @@ fn run_audio_server_blocking(env: EnvConfig, runtime_config: Arc<RwLock<RuntimeC
             Ok(stream) => {
                 let peer = stream.peer_addr().ok();
                 info!(?peer, "audio stream connected");
-                let env_for_conn = env.clone();
                 let runtime_config_for_conn = runtime_config.clone();
                 let job_tx_for_conn = job_tx.clone();
                 thread::Builder::new()
                     .name("audio-tcp-connection".to_string())
                     .spawn(move || {
-                        if let Err(e) = handle_audio_connection_blocking(stream, env_for_conn, runtime_config_for_conn, job_tx_for_conn) {
+                        if let Err(e) = handle_audio_connection_blocking(stream, runtime_config_for_conn, job_tx_for_conn) {
                             warn!(?peer, error = %e, "audio connection ended");
                         }
                     })?;
@@ -670,7 +878,6 @@ fn run_audio_server_blocking(env: EnvConfig, runtime_config: Arc<RwLock<RuntimeC
 
 fn handle_audio_connection_blocking(
     mut stream: StdTcpStream,
-    env: EnvConfig,
     runtime_config: Arc<RwLock<RuntimeConfig>>,
     job_tx: mpsc::Sender<TranscribeJob>,
 ) -> Result<()> {
@@ -694,21 +901,12 @@ fn handle_audio_connection_blocking(
             "channels": 1
         }),
     };
-    let vad_info = VadInfo {
-        enabled: true,
-        engine: "silero".to_string(),
-        threshold: Some(env.vad_threshold),
-    };
     let context: Option<Value> = None;
 
     let mut byte_buf = vec![0u8; 8192];
     let mut pending_samples: Vec<i16> = Vec::new();
-    let pre_roll_len = (env.pre_roll_seconds * SAMPLE_RATE as f64) as usize;
-    let max_segment_samples = (env.max_segment_seconds * SAMPLE_RATE as f64) as usize;
-    let min_segment_samples = (env.min_segment_seconds * SAMPLE_RATE as f64) as usize;
-    let silence_cut_samples = (env.silence_cut_seconds * SAMPLE_RATE as f64) as usize;
 
-    let mut pre_roll: VecDeque<f32> = VecDeque::with_capacity(pre_roll_len + VAD_FRAME_SAMPLES);
+    let mut pre_roll: VecDeque<f32> = VecDeque::new();
     let mut current_segment: Vec<f32> = Vec::new();
     let mut current_start_sample: u64 = 0;
     let mut total_samples_seen: u64 = 0;
@@ -733,18 +931,32 @@ fn handle_audio_connection_blocking(
             total_samples_seen += VAD_FRAME_SAMPLES as u64;
 
             let probability = vad.predict(frame_i16);
-            let is_voice = probability >= env.vad_threshold;
-            let vad_debug = runtime_config.read().unwrap().logging.vad_debug;
+            let (transcription, vad_debug) = current_transcription_settings(&runtime_config);
+            let vad_threshold = transcription.vad_threshold;
+            let pre_roll_len = seconds_to_samples_allow_zero(transcription.pre_roll_seconds);
+            let max_segment_samples = seconds_to_samples(transcription.max_segment_seconds);
+            let min_segment_samples = seconds_to_samples(transcription.min_segment_seconds);
+            let silence_cut_samples = seconds_to_samples(transcription.silence_cut_seconds);
+            let vad_info = VadInfo {
+                enabled: true,
+                engine: "silero".to_string(),
+                threshold: Some(vad_threshold),
+            };
+            let is_voice = probability >= vad_threshold;
             if vad_debug {
-                debug!(probability = probability, threshold = env.vad_threshold, is_voice = is_voice, "vad frame");
+                debug!(probability = probability, threshold = vad_threshold, is_voice = is_voice, "vad frame");
             }
 
             if !in_speech {
-                for &sample in &frame_f32 {
-                    if pre_roll.len() >= pre_roll_len {
-                        pre_roll.pop_front();
+                if pre_roll_len == 0 {
+                    pre_roll.clear();
+                } else {
+                    for &sample in &frame_f32 {
+                        while pre_roll.len() >= pre_roll_len {
+                            pre_roll.pop_front();
+                        }
+                        pre_roll.push_back(sample);
                     }
-                    pre_roll.push_back(sample);
                 }
 
                 if is_voice {
@@ -793,6 +1005,13 @@ fn handle_audio_connection_blocking(
     }
 
     if in_speech && !current_segment.is_empty() {
+        let (transcription, _) = current_transcription_settings(&runtime_config);
+        let min_segment_samples = seconds_to_samples(transcription.min_segment_seconds);
+        let vad_info = VadInfo {
+            enabled: true,
+            engine: "silero".to_string(),
+            threshold: Some(transcription.vad_threshold),
+        };
         flush_segment_if_valid_blocking(
             &job_tx,
             &mut current_segment,
@@ -807,6 +1026,19 @@ fn handle_audio_connection_blocking(
     }
 
     Ok(())
+}
+
+fn current_transcription_settings(runtime_config: &Arc<RwLock<RuntimeConfig>>) -> (TranscriptionConfig, bool) {
+    let cfg = runtime_config.read().unwrap();
+    (cfg.transcription.normalized(), cfg.logging.vad_debug)
+}
+
+fn seconds_to_samples(seconds: f64) -> usize {
+    (seconds * SAMPLE_RATE as f64).round().max(1.0) as usize
+}
+
+fn seconds_to_samples_allow_zero(seconds: f64) -> usize {
+    (seconds * SAMPLE_RATE as f64).round().max(0.0) as usize
 }
 
 fn flush_segment_if_valid_blocking(
@@ -955,6 +1187,7 @@ async fn run_web_admin(state: SharedState) -> Result<()> {
         .route("/api/models", get(get_models))
         .route("/api/models/download", post(download_model))
         .route("/api/models/activate", post(activate_model))
+        .route("/api/models/huggingface", post(add_huggingface_model))
         .route("/api/test/webhook", post(test_webhook))
         .route("/api/test/mqtt", post(test_mqtt))
         .route("/api/transcribe", post(rest_transcribe))
@@ -977,6 +1210,8 @@ async fn status(State(state): State<SharedState>) -> impl IntoResponse {
     let cfg = state.runtime_config.read().unwrap().clone();
     let active_model = active_model_profile(&cfg, &state.env);
     let active_model_exists = Path::new(&active_model.path).exists();
+    let transcription = cfg.transcription.normalized();
+    let language = transcription.language.clone();
     Json(json!({
         "ok": true,
         "version": env!("CARGO_PKG_VERSION"),
@@ -987,9 +1222,10 @@ async fn status(State(state): State<SharedState>) -> impl IntoResponse {
         "active_model_name": active_model.name,
         "active_model_path": active_model.path,
         "active_model_exists": active_model_exists,
-        "language": state.env.language.clone(),
+        "language": language,
         "vad_backend": "voice_activity_detector/Silero VAD V5",
-        "vad_threshold": state.env.vad_threshold,
+        "vad_threshold": transcription.vad_threshold,
+        "transcription": transcription,
         "output_jsonl": state.env.output_jsonl.clone(),
         "logging": cfg.logging,
     }))
@@ -1000,7 +1236,8 @@ async fn get_config(State(state): State<SharedState>) -> impl IntoResponse {
     Json(cfg)
 }
 
-async fn post_config(State(state): State<SharedState>, Json(new_cfg): Json<RuntimeConfig>) -> impl IntoResponse {
+async fn post_config(State(state): State<SharedState>, Json(mut new_cfg): Json<RuntimeConfig>) -> impl IntoResponse {
+    normalize_runtime_config(&mut new_cfg, &state.env);
     {
         let mut guard = state.runtime_config.write().unwrap();
         *guard = new_cfg.clone();
@@ -1013,6 +1250,24 @@ async fn post_config(State(state): State<SharedState>, Json(new_cfg): Json<Runti
     match save_runtime_config(&state.config_path, &new_cfg) {
         Ok(_) => Json(json!({ "ok": true, "log_reload": reload_result.is_ok() })),
         Err(e) => Json(json!({ "ok": false, "error": e.to_string(), "log_reload_error": reload_result.err() })),
+    }
+}
+
+fn normalize_runtime_config(cfg: &mut RuntimeConfig, env: &EnvConfig) {
+    cfg.transcription = cfg.transcription.normalized();
+    if cfg.models.profiles.is_empty() {
+        cfg.models.profiles = default_model_profiles(&env.default_model_id, &env.model_path, &env.model_url);
+    }
+    ensure_finnish_nlp_profile(&mut cfg.models.profiles);
+    if cfg.models.active_model_id.trim().is_empty()
+        || !cfg.models.profiles.iter().any(|p| p.id.as_str() == cfg.models.active_model_id.as_str())
+    {
+        cfg.models.active_model_id = cfg
+            .models
+            .profiles
+            .first()
+            .map(|p| p.id.clone())
+            .unwrap_or_else(|| env.default_model_id.clone());
     }
 }
 
@@ -1091,6 +1346,300 @@ async fn activate_model(State(state): State<SharedState>, Json(req): Json<ModelA
         })),
         Err(e) => Json(json!({"ok": false, "error": e.to_string()})),
     }
+}
+
+async fn add_huggingface_model(
+    State(state): State<SharedState>,
+    Json(req): Json<HuggingFaceModelAddRequest>,
+) -> impl IntoResponse {
+    let (repo_id, requested_filename) = match split_huggingface_repo_and_filename(&req.repo_id, req.filename.as_deref()) {
+        Ok(v) => v,
+        Err(e) => return Json(json!({"ok": false, "error": e.to_string()})),
+    };
+
+    let api_url = format!("https://huggingface.co/api/models/{repo_id}");
+    let resp = match reqwest::get(&api_url).await {
+        Ok(resp) => resp,
+        Err(e) => return Json(json!({"ok": false, "repo_id": repo_id, "error": e.to_string()})),
+    };
+    if !resp.status().is_success() {
+        return Json(json!({
+            "ok": false,
+            "repo_id": repo_id,
+            "error": format!("Hugging Face returned {}", resp.status())
+        }));
+    }
+
+    let info: HuggingFaceModelInfo = match resp.json().await {
+        Ok(info) => info,
+        Err(e) => return Json(json!({"ok": false, "repo_id": repo_id, "error": e.to_string()})),
+    };
+
+    let filename = match select_huggingface_model_file(&info.siblings, requested_filename.as_deref()) {
+        Ok(filename) => filename,
+        Err(e) => return Json(json!({"ok": false, "repo_id": repo_id, "error": e.to_string()})),
+    };
+
+    let profile = huggingface_model_profile(&repo_id, &filename, req.id.as_deref(), req.name.as_deref());
+    let mut cfg = state.runtime_config.read().unwrap().clone();
+    let replaced = if let Some(existing) = cfg.models.profiles.iter_mut().find(|p| p.id.as_str() == profile.id.as_str()) {
+        *existing = profile.clone();
+        true
+    } else {
+        cfg.models.profiles.push(profile.clone());
+        false
+    };
+    if req.set_active {
+        cfg.models.active_model_id = profile.id.clone();
+    }
+    normalize_runtime_config(&mut cfg, &state.env);
+
+    {
+        let mut guard = state.runtime_config.write().unwrap();
+        *guard = cfg.clone();
+    }
+
+    match save_runtime_config(&state.config_path, &cfg) {
+        Ok(_) => Json(json!({
+            "ok": true,
+            "repo_id": repo_id,
+            "filename": filename,
+            "profile": profile,
+            "replaced": replaced,
+            "active_model_id": cfg.models.active_model_id.clone(),
+        })),
+        Err(e) => Json(json!({"ok": false, "repo_id": repo_id, "error": e.to_string()})),
+    }
+}
+
+fn split_huggingface_repo_and_filename(repo_input: &str, filename_input: Option<&str>) -> Result<(String, Option<String>)> {
+    let mut input = repo_input.trim().to_string();
+    if input.is_empty() {
+        return Err(anyhow!("Hugging Face repo name is empty; expected owner/model"));
+    }
+
+    input = input
+        .split('?')
+        .next()
+        .unwrap_or("")
+        .split('#')
+        .next()
+        .unwrap_or("")
+        .trim()
+        .trim_matches('/')
+        .to_string();
+
+    let stripped_url = ["https://huggingface.co/", "http://huggingface.co/"]
+        .iter()
+        .find_map(|prefix| input.strip_prefix(*prefix).map(|rest| rest.trim_matches('/').to_string()));
+    if let Some(stripped_url) = stripped_url {
+        input = stripped_url;
+    }
+
+    let mut filename = filename_input
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(|s| s.trim_start_matches('/').to_string());
+
+    for marker in ["/resolve/", "/blob/"] {
+        if let Some(pos) = input.find(marker) {
+            let repo = input[..pos].trim_matches('/').to_string();
+            let revision_and_file = &input[pos + marker.len()..];
+            if filename.is_none() {
+                filename = filename_after_revision(revision_and_file);
+            }
+            input = repo;
+            break;
+        }
+    }
+
+    if let Some(pos) = input.find("/tree/") {
+        input = input[..pos].trim_matches('/').to_string();
+    }
+
+    if filename.is_none() {
+        if let Some(pos) = input.find(':') {
+            let maybe_file = input[pos + 1..].trim().trim_start_matches('/');
+            if !maybe_file.is_empty() {
+                filename = Some(maybe_file.to_string());
+            }
+            input = input[..pos].trim_matches('/').to_string();
+        }
+    }
+
+    if filename.is_none() {
+        let parts = input.split('/').map(ToOwned::to_owned).collect::<Vec<_>>();
+        if parts.len() > 2 {
+            let maybe_file = parts[2..].join("/");
+            if maybe_file.to_lowercase().ends_with(".bin") {
+                filename = Some(maybe_file);
+                input = format!("{}/{}", parts[0], parts[1]);
+            }
+        }
+    }
+
+    let repo_id = input.trim_matches('/').to_string();
+    validate_huggingface_repo_id(&repo_id)?;
+    Ok((repo_id, filename))
+}
+
+fn filename_after_revision(revision_and_file: &str) -> Option<String> {
+    revision_and_file
+        .split_once('/')
+        .map(|(_, file)| file.trim().trim_start_matches('/').to_string())
+        .filter(|file| !file.is_empty())
+}
+
+fn validate_huggingface_repo_id(repo_id: &str) -> Result<()> {
+    let parts = repo_id.split('/').collect::<Vec<_>>();
+    if parts.len() != 2 || parts.iter().any(|part| part.trim().is_empty()) {
+        return Err(anyhow!("expected Hugging Face repo name in owner/model form"));
+    }
+    if !repo_id
+        .chars()
+        .all(|c| c.is_ascii_alphanumeric() || matches!(c, '/' | '-' | '_' | '.'))
+    {
+        return Err(anyhow!("Hugging Face repo name contains unsupported characters"));
+    }
+    Ok(())
+}
+
+fn select_huggingface_model_file(siblings: &[HuggingFaceSibling], requested_filename: Option<&str>) -> Result<String> {
+    let bin_files = siblings
+        .iter()
+        .map(|s| s.rfilename.as_str())
+        .filter(|name| name.to_lowercase().ends_with(".bin"))
+        .collect::<Vec<_>>();
+
+    if let Some(requested) = requested_filename.map(str::trim).filter(|s| !s.is_empty()) {
+        let requested = requested.trim_start_matches('/');
+        if bin_files.iter().any(|name| *name == requested) {
+            return Ok(requested.to_string());
+        }
+        return Err(anyhow!(
+            "file '{}' was not found in the Hugging Face repo; available .bin files: {}",
+            requested,
+            summarize_candidates(&bin_files)
+        ));
+    }
+
+    let mut candidates = bin_files;
+    if candidates.is_empty() {
+        return Err(anyhow!("no .bin model file was found in the Hugging Face repo"));
+    }
+
+    candidates.sort_by(|a, b| {
+        huggingface_file_score(b)
+            .cmp(&huggingface_file_score(a))
+            .then_with(|| a.cmp(b))
+    });
+    Ok(candidates[0].to_string())
+}
+
+fn huggingface_file_score(filename: &str) -> i32 {
+    let name = filename.to_lowercase();
+    let mut score = 0;
+    if name.contains("ggml") {
+        score += 100;
+    }
+    if name.contains("large-v3") {
+        score += 90;
+    } else if name.contains("large-v2") {
+        score += 85;
+    } else if name.contains("large") {
+        score += 80;
+    } else if name.contains("medium") {
+        score += 70;
+    } else if name.contains("small") {
+        score += 60;
+    } else if name.contains("base") {
+        score += 50;
+    } else if name.contains("tiny") {
+        score += 40;
+    }
+    score
+}
+
+fn summarize_candidates(candidates: &[&str]) -> String {
+    if candidates.is_empty() {
+        return "none".to_string();
+    }
+    let mut names = candidates.iter().take(8).copied().collect::<Vec<_>>().join(", ");
+    if candidates.len() > 8 {
+        names.push_str(", ...");
+    }
+    names
+}
+
+fn huggingface_model_profile(repo_id: &str, filename: &str, requested_id: Option<&str>, requested_name: Option<&str>) -> ModelProfile {
+    let basename = filename.rsplit('/').next().unwrap_or(filename);
+    let stem = basename.strip_suffix(".bin").unwrap_or(basename);
+    let id = requested_id
+        .map(str::trim)
+        .filter(|id| !id.is_empty())
+        .map(ToOwned::to_owned)
+        .unwrap_or_else(|| format!("hf-{}-{}", sanitize_identifier(repo_id), sanitize_identifier(stem)));
+    let name = requested_name
+        .map(str::trim)
+        .filter(|name| !name.is_empty())
+        .map(ToOwned::to_owned)
+        .unwrap_or_else(|| format!("{repo_id} / {basename}"));
+
+    ModelProfile {
+        id,
+        name,
+        path: format!("/models/{}-{}", sanitize_identifier(repo_id), sanitize_filename(basename)),
+        url: format!("https://huggingface.co/{repo_id}/resolve/main/{}", encode_huggingface_path(filename)),
+        description: format!("Hugging Face GGML model: {repo_id}/{filename}"),
+        recommended_vram_gb: None,
+    }
+}
+
+fn sanitize_identifier(value: &str) -> String {
+    let mut out = String::new();
+    let mut last_dash = false;
+    for ch in value.chars().flat_map(|c| c.to_lowercase()) {
+        if ch.is_ascii_alphanumeric() {
+            out.push(ch);
+            last_dash = false;
+        } else if !last_dash {
+            out.push('-');
+            last_dash = true;
+        }
+    }
+    out.trim_matches('-').to_string()
+}
+
+fn sanitize_filename(value: &str) -> String {
+    value
+        .chars()
+        .map(|ch| {
+            if ch.is_ascii_alphanumeric() || matches!(ch, '-' | '_' | '.') {
+                ch
+            } else {
+                '-'
+            }
+        })
+        .collect()
+}
+
+fn encode_huggingface_path(path: &str) -> String {
+    path.split('/')
+        .map(percent_encode_path_segment)
+        .collect::<Vec<_>>()
+        .join("/")
+}
+
+fn percent_encode_path_segment(segment: &str) -> String {
+    let mut out = String::new();
+    for byte in segment.bytes() {
+        if byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.' | b'~') {
+            out.push(byte as char);
+        } else {
+            out.push_str(&format!("%{byte:02X}"));
+        }
+    }
+    out
 }
 
 async fn ensure_model_downloaded(profile: &ModelProfile) -> Result<()> {

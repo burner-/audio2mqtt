@@ -83,8 +83,11 @@ http://localhost:8080
 
 You can configure:
 
+- ASR language, thread count and beam size
+- VAD threshold and segment timing
 - active model
 - model download URL profiles
+- Hugging Face GGML model profiles by repo name
 - logging level
 - frame-level VAD debug on/off
 - MQTT enabled/disabled
@@ -112,6 +115,17 @@ trace
 ```
 
 VAD frame debug is a separate checkbox because it can produce a lot of logs on a continuous stream.
+
+## Hugging Face models
+
+The web admin includes a built-in profile for:
+
+```text
+Finnish-NLP/Finnish-finetuned-whisper-models-ggml-format
+ggml-model-fi-large-v3.bin
+```
+
+You can also add other Hugging Face GGML Whisper models by repo name in the web admin. Use `owner/model` form, and optionally set a `.bin` file name if the repo contains more than one candidate.
 
 ## REST transcription
 

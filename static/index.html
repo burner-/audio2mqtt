@@ -41,6 +41,12 @@
     <h2>Settings</h2>
     <div id="status" class="small">Loading...</div>
 
+    <h3>Transcription</h3>
+    <div class="row"><div><label>Language</label><input id="language" /></div><div><label>Threads</label><input id="nThreads" type="number" min="1" step="1" /></div></div>
+    <div class="row"><div><label>Beam size</label><input id="beamSize" type="number" min="1" step="1" /></div><div><label>VAD threshold</label><input id="vadThreshold" type="number" min="0" max="1" step="0.01" /></div></div>
+    <div class="row"><div><label>Min segment seconds</label><input id="minSegmentSeconds" type="number" min="0.1" step="0.1" /></div><div><label>Max segment seconds</label><input id="maxSegmentSeconds" type="number" min="0.1" step="0.1" /></div></div>
+    <div class="row"><div><label>Silence cut seconds</label><input id="silenceCutSeconds" type="number" min="0.05" step="0.05" /></div><div><label>Pre-roll seconds</label><input id="preRollSeconds" type="number" min="0" step="0.05" /></div></div>
+
     <h3>Model</h3>
     <label>Active / selectable model</label>
     <select id="modelSelect"></select>
@@ -52,6 +58,13 @@
     <label>Model profiles</label>
     <div class="small">One row per model: <code>id|name|path|url|recommended_vram_gb|description</code></div>
     <textarea id="modelsText"></textarea>
+
+    <label>Hugging Face repo</label>
+    <input id="hfRepo" placeholder="Finnish-NLP/Finnish-finetuned-whisper-models-ggml-format" />
+    <label>Model file name (optional)</label>
+    <input id="hfFilename" placeholder="ggml-model-fi-large-v3.bin" />
+    <label><input id="hfSetActive" type="checkbox" style="width:auto"> Activate after adding</label>
+    <button class="secondary" onclick="addHuggingFaceModel()">Add Hugging Face model</button>
 
     <h3>Logging</h3>
     <label>Log level</label>
@@ -116,7 +129,8 @@ async function loadStatus() {
   const s = await r.json();
   const modelExists = s.active_model_exists ? '<span class="ok">available</span>' : '<span class="bad">missing</span>';
   const vadDebug = s.logging?.vad_debug ? '<span class="warn">on</span>' : '<span class="ok">off</span>';
-  document.getElementById('status').innerHTML = `Status: <span class="ok">OK</span> v${s.version}<br>VAD: ${s.vad_backend}<br>Active model: ${s.active_model_name} (${s.active_model_id}) - ${modelExists}<br>Path: ${s.active_model_path}<br>Input: ${s.asr_bind}<br>Output: ${s.output_jsonl}<br>Log level: ${s.logging?.level || 'info'}; VAD frame debug: ${vadDebug}`;
+  const t = s.transcription || {};
+  document.getElementById('status').innerHTML = `Status: <span class="ok">OK</span> v${s.version}<br>ASR: ${t.language || s.language || 'fi'}, ${t.n_threads || 8} threads, beam ${t.beam_size || 3}<br>VAD: ${s.vad_backend}, threshold ${t.vad_threshold ?? s.vad_threshold}<br>Active model: ${s.active_model_name} (${s.active_model_id}) - ${modelExists}<br>Path: ${s.active_model_path}<br>Input: ${s.asr_bind}<br>Output: ${s.output_jsonl}<br>Log level: ${s.logging?.level || 'info'}; VAD frame debug: ${vadDebug}`;
 }
 
 async function loadModels() {
@@ -148,6 +162,15 @@ async function loadConfig() {
   cfg = await r.json();
   cfg.models = cfg.models || { active_model_id: 'large-v3', profiles: [] };
   cfg.logging = cfg.logging || { level: 'info', vad_debug: false };
+  cfg.transcription = cfg.transcription || {};
+  document.getElementById('language').value = cfg.transcription.language || 'fi';
+  document.getElementById('nThreads').value = cfg.transcription.n_threads ?? 8;
+  document.getElementById('beamSize').value = cfg.transcription.beam_size ?? 3;
+  document.getElementById('vadThreshold').value = cfg.transcription.vad_threshold ?? 0.55;
+  document.getElementById('minSegmentSeconds').value = cfg.transcription.min_segment_seconds ?? 1.0;
+  document.getElementById('maxSegmentSeconds').value = cfg.transcription.max_segment_seconds ?? 30.0;
+  document.getElementById('silenceCutSeconds').value = cfg.transcription.silence_cut_seconds ?? 1.2;
+  document.getElementById('preRollSeconds').value = cfg.transcription.pre_roll_seconds ?? 0.4;
   document.getElementById('logLevel').value = cfg.logging.level || 'info';
   document.getElementById('vadDebug').checked = !!cfg.logging.vad_debug;
   document.getElementById('mqttEnabled').checked = cfg.mqtt.enabled;
@@ -174,6 +197,11 @@ function parseModelProfiles() {
     });
 }
 
+function numberValue(id, fallback) {
+  const value = Number(document.getElementById(id).value);
+  return Number.isFinite(value) ? value : fallback;
+}
+
 function readConfigFromForm() {
   const hooks = document.getElementById('webhooks').value
     .split('\n')
@@ -197,6 +225,16 @@ function readConfigFromForm() {
     },
     webhooks: hooks,
     models: { active_model_id: active, profiles: parseModelProfiles() },
+    transcription: {
+      language: document.getElementById('language').value || 'fi',
+      n_threads: numberValue('nThreads', 8),
+      beam_size: numberValue('beamSize', 3),
+      vad_threshold: numberValue('vadThreshold', 0.55),
+      min_segment_seconds: numberValue('minSegmentSeconds', 1.0),
+      max_segment_seconds: numberValue('maxSegmentSeconds', 30.0),
+      silence_cut_seconds: numberValue('silenceCutSeconds', 1.2),
+      pre_roll_seconds: numberValue('preRollSeconds', 0.4)
+    },
     logging: {
       level: document.getElementById('logLevel').value || 'info',
       vad_debug: document.getElementById('vadDebug').checked
@@ -227,6 +265,30 @@ async function activateSelectedModel() {
   showResult(`Activating model ${id}. It will be downloaded first if missing.`);
   const r = await fetch('/api/models/activate', { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({id, download_if_missing: true}) });
   showResult(await r.json());
+  await loadConfig(); await loadModels(); await loadStatus();
+}
+
+async function addHuggingFaceModel() {
+  const repo = document.getElementById('hfRepo').value.trim();
+  if (!repo) {
+    showResult('Enter a Hugging Face repo name, for example Finnish-NLP/Finnish-finetuned-whisper-models-ggml-format.');
+    return;
+  }
+  await saveConfig();
+  const body = {
+    repo_id: repo,
+    filename: document.getElementById('hfFilename').value.trim() || null,
+    set_active: document.getElementById('hfSetActive').checked
+  };
+  showResult(`Adding Hugging Face model ${repo}.`);
+  const r = await fetch('/api/models/huggingface', { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify(body) });
+  const out = await r.json();
+  showResult(out);
+  if (out.ok) {
+    document.getElementById('hfRepo').value = '';
+    document.getElementById('hfFilename').value = '';
+    document.getElementById('hfSetActive').checked = false;
+  }
   await loadConfig(); await loadModels(); await loadStatus();
 }
 
