@@ -1,0 +1,249 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>audio2mqtt Admin</title>
+  <style>
+    :root { font-family: system-ui, -apple-system, Segoe UI, sans-serif; color-scheme: dark; }
+    body { margin: 0; background: #111827; color: #e5e7eb; }
+    header { padding: 18px 24px; background: #0f172a; border-bottom: 1px solid #334155; }
+    main { padding: 24px; display: grid; grid-template-columns: minmax(380px, 580px) 1fr; gap: 20px; }
+    h1 { margin: 0; font-size: 22px; }
+    h2 { margin: 0 0 12px; font-size: 18px; }
+    h3 { margin-top: 24px; margin-bottom: 8px; font-size: 15px; color: #dbeafe; }
+    .card { background: #1f2937; border: 1px solid #374151; border-radius: 14px; padding: 18px; box-shadow: 0 10px 30px rgba(0,0,0,.2); }
+    label { display: block; margin: 10px 0 5px; color: #cbd5e1; font-size: 13px; }
+    input, textarea, select { box-sizing: border-box; width: 100%; background: #0b1220; color: #e5e7eb; border: 1px solid #475569; border-radius: 10px; padding: 10px; }
+    textarea { min-height: 120px; font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; font-size: 12px; }
+    button { background: #2563eb; color: white; border: none; border-radius: 10px; padding: 10px 14px; margin: 10px 8px 0 0; cursor: pointer; font-weight: 650; }
+    button.secondary { background: #475569; }
+    pre { white-space: pre-wrap; background: #0b1220; border: 1px solid #374151; padding: 12px; border-radius: 10px; overflow: auto; }
+    code { color: #bfdbfe; }
+    .row { display: grid; grid-template-columns: 1fr 120px; gap: 10px; }
+    .small { font-size: 12px; color: #94a3b8; }
+    .ok { color: #86efac; }
+    .bad { color: #fca5a5; }
+    .warn { color: #fde68a; }
+    .model-list { display: grid; gap: 8px; margin-top: 8px; }
+    .model-item { border: 1px solid #374151; border-radius: 10px; padding: 10px; background: #111827; }
+    .pill { display: inline-block; padding: 2px 8px; border-radius: 999px; font-size: 11px; background: #334155; margin-left: 6px; }
+    @media (max-width: 900px) { main { grid-template-columns: 1fr; } }
+  </style>
+</head>
+<body>
+<header>
+  <h1>audio2mqtt Admin</h1>
+  <div class="small">Rust + whisper.cpp CUDA + Silero VAD V5 + MQTT client + Webhook + REST transcription</div>
+</header>
+<main>
+  <section class="card">
+    <h2>Settings</h2>
+    <div id="status" class="small">Loading...</div>
+
+    <h3>Model</h3>
+    <label>Active / selectable model</label>
+    <select id="modelSelect"></select>
+    <button onclick="downloadSelectedModel()">Download selected model</button>
+    <button class="secondary" onclick="activateSelectedModel()">Activate selected model</button>
+    <div class="small">Activation downloads the model first if it is missing. The new model is used by the next transcription job.</div>
+    <div id="modelList" class="model-list"></div>
+
+    <label>Model profiles</label>
+    <div class="small">One row per model: <code>id|name|path|url|recommended_vram_gb|description</code></div>
+    <textarea id="modelsText"></textarea>
+
+    <h3>Logging</h3>
+    <label>Log level</label>
+    <select id="logLevel">
+      <option value="error">error</option>
+      <option value="warn">warn</option>
+      <option value="info">info</option>
+      <option value="debug">debug</option>
+      <option value="trace">trace</option>
+    </select>
+    <label><input id="vadDebug" type="checkbox" style="width:auto"> Enable frame-level VAD debug logging</label>
+    <div class="small">Keep VAD debug disabled unless you are tuning the VAD. It logs a line for every 512-sample VAD frame.</div>
+
+    <h3>MQTT</h3>
+    <label><input id="mqttEnabled" type="checkbox" style="width:auto"> Enable MQTT publishing</label>
+    <label>Host</label><input id="mqttHost" />
+    <div class="row"><div><label>Topic</label><input id="mqttTopic" /></div><div><label>Port</label><input id="mqttPort" type="number" /></div></div>
+    <div class="row"><div><label>Username</label><input id="mqttUsername" /></div><div><label>QoS</label><select id="mqttQos"><option>0</option><option selected>1</option><option>2</option></select></div></div>
+    <label>Password</label><input id="mqttPassword" type="password" />
+    <label>Client ID</label><input id="mqttClientId" />
+
+    <h3>Webhooks</h3>
+    <div class="small">One endpoint per row: <code>name|enabled|url|bearer_token</code>. Token can be empty.</div>
+    <textarea id="webhooks"></textarea>
+
+    <button onclick="saveConfig()">Save settings</button>
+    <button class="secondary" onclick="testMqtt()">Test MQTT</button>
+    <button class="secondary" onclick="testWebhook()">Test webhook</button>
+    <pre id="result"></pre>
+  </section>
+
+  <section class="card">
+    <h2>Live transcripts</h2>
+    <div class="small">The same JSON is written to stdout, output/transcripts.jsonl, MQTT and webhooks when enabled.</div>
+    <pre id="events"></pre>
+
+    <h3>REST transcription</h3>
+    <div class="small">Endpoint: <code>POST /api/transcribe</code>. Send base64 WAV or base64 raw <code>pcm_s16le</code>. Audio must be 16 kHz mono.</div>
+    <pre>{
+  "audio": {
+    "format": "wav",
+    "encoding": "base64",
+    "data": "UklGRiQAAABXQVZF..."
+  },
+  "context": {
+    "device_id": "frontdesk-mic-01",
+    "session_id": "abc-789"
+  }
+}</pre>
+  </section>
+</main>
+<script>
+let cfg = null;
+let modelsState = null;
+
+function showResult(obj) {
+  document.getElementById('result').textContent = typeof obj === 'string' ? obj : JSON.stringify(obj, null, 2);
+}
+
+async function loadStatus() {
+  const r = await fetch('/api/status');
+  const s = await r.json();
+  const modelExists = s.active_model_exists ? '<span class="ok">available</span>' : '<span class="bad">missing</span>';
+  const vadDebug = s.logging?.vad_debug ? '<span class="warn">on</span>' : '<span class="ok">off</span>';
+  document.getElementById('status').innerHTML = `Status: <span class="ok">OK</span> v${s.version}<br>VAD: ${s.vad_backend}<br>Active model: ${s.active_model_name} (${s.active_model_id}) - ${modelExists}<br>Path: ${s.active_model_path}<br>Input: ${s.asr_bind}<br>Output: ${s.output_jsonl}<br>Log level: ${s.logging?.level || 'info'}; VAD frame debug: ${vadDebug}`;
+}
+
+async function loadModels() {
+  const r = await fetch('/api/models');
+  modelsState = await r.json();
+  const select = document.getElementById('modelSelect');
+  select.innerHTML = '';
+  for (const m of modelsState.profiles || []) {
+    const opt = document.createElement('option');
+    opt.value = m.id;
+    opt.textContent = `${m.name} (${m.exists ? 'downloaded' : 'missing'})`;
+    if (m.active) opt.selected = true;
+    select.appendChild(opt);
+  }
+  document.getElementById('modelList').innerHTML = (modelsState.profiles || []).map(m => `
+    <div class="model-item">
+      <b>${m.name}</b>
+      ${m.active ? '<span class="pill ok">active</span>' : ''}
+      ${m.exists ? '<span class="pill ok">downloaded</span>' : '<span class="pill warn">missing</span>'}
+      ${m.recommended_vram_gb ? `<span class="pill">${m.recommended_vram_gb} GB+ VRAM</span>` : ''}
+      <div class="small">id: ${m.id}</div>
+      <div class="small">path: ${m.path}</div>
+      <div class="small">${m.description || ''}</div>
+    </div>`).join('');
+}
+
+async function loadConfig() {
+  const r = await fetch('/api/config');
+  cfg = await r.json();
+  cfg.models = cfg.models || { active_model_id: 'large-v3', profiles: [] };
+  cfg.logging = cfg.logging || { level: 'info', vad_debug: false };
+  document.getElementById('logLevel').value = cfg.logging.level || 'info';
+  document.getElementById('vadDebug').checked = !!cfg.logging.vad_debug;
+  document.getElementById('mqttEnabled').checked = cfg.mqtt.enabled;
+  document.getElementById('mqttHost').value = cfg.mqtt.host || '';
+  document.getElementById('mqttPort').value = cfg.mqtt.port || 1883;
+  document.getElementById('mqttTopic').value = cfg.mqtt.topic || 'audio2mqtt/transcripts';
+  document.getElementById('mqttUsername').value = cfg.mqtt.username || '';
+  document.getElementById('mqttPassword').value = cfg.mqtt.password || '';
+  document.getElementById('mqttClientId').value = cfg.mqtt.client_id || 'audio2mqtt';
+  document.getElementById('mqttQos').value = String(cfg.mqtt.qos ?? 1);
+  document.getElementById('webhooks').value = (cfg.webhooks || []).map(h => `${h.name}|${h.enabled}|${h.url}|${h.bearer_token || ''}`).join('\n');
+  document.getElementById('modelsText').value = (cfg.models.profiles || []).map(m => `${m.id}|${m.name}|${m.path}|${m.url}|${m.recommended_vram_gb || ''}|${m.description || ''}`).join('\n');
+}
+
+function parseModelProfiles() {
+  return document.getElementById('modelsText').value
+    .split('\n')
+    .map(x => x.trim())
+    .filter(Boolean)
+    .map(line => {
+      const parts = line.split('|');
+      const [id, name, path, url, vram, ...descParts] = parts;
+      return { id: id || 'model', name: name || id || 'model', path: path || '', url: url || '', description: descParts.join('|') || '', recommended_vram_gb: vram ? Number(vram) : null };
+    });
+}
+
+function readConfigFromForm() {
+  const hooks = document.getElementById('webhooks').value
+    .split('\n')
+    .map(x => x.trim())
+    .filter(Boolean)
+    .map(line => {
+      const [name, enabled, url, token] = line.split('|');
+      return { name: name || 'webhook', enabled: String(enabled).toLowerCase() === 'true', url: url || '', bearer_token: token || null };
+    });
+  const active = (cfg?.models?.active_model_id) || (modelsState?.active_model_id) || 'large-v3';
+  return {
+    mqtt: {
+      enabled: document.getElementById('mqttEnabled').checked,
+      host: document.getElementById('mqttHost').value,
+      port: Number(document.getElementById('mqttPort').value || 1883),
+      username: document.getElementById('mqttUsername').value || null,
+      password: document.getElementById('mqttPassword').value || null,
+      client_id: document.getElementById('mqttClientId').value || 'audio2mqtt',
+      topic: document.getElementById('mqttTopic').value || 'audio2mqtt/transcripts',
+      qos: Number(document.getElementById('mqttQos').value || 1)
+    },
+    webhooks: hooks,
+    models: { active_model_id: active, profiles: parseModelProfiles() },
+    logging: {
+      level: document.getElementById('logLevel').value || 'info',
+      vad_debug: document.getElementById('vadDebug').checked
+    }
+  };
+}
+
+async function saveConfig() {
+  const body = readConfigFromForm();
+  const r = await fetch('/api/config', { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify(body) });
+  const out = await r.json();
+  showResult(out);
+  await loadConfig(); await loadModels(); await loadStatus();
+}
+
+async function downloadSelectedModel() {
+  await saveConfig();
+  const id = document.getElementById('modelSelect').value;
+  showResult(`Downloading model ${id}. Large downloads can take a while.`);
+  const r = await fetch('/api/models/download', { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({id}) });
+  showResult(await r.json());
+  await loadModels(); await loadStatus();
+}
+
+async function activateSelectedModel() {
+  await saveConfig();
+  const id = document.getElementById('modelSelect').value;
+  showResult(`Activating model ${id}. It will be downloaded first if missing.`);
+  const r = await fetch('/api/models/activate', { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({id, download_if_missing: true}) });
+  showResult(await r.json());
+  await loadConfig(); await loadModels(); await loadStatus();
+}
+
+async function testMqtt() { await saveConfig(); const r = await fetch('/api/test/mqtt', { method: 'POST' }); showResult(await r.json()); }
+async function testWebhook() { await saveConfig(); const r = await fetch('/api/test/webhook', { method: 'POST' }); showResult(await r.json()); }
+
+function connectEvents() {
+  const pre = document.getElementById('events');
+  const es = new EventSource('/api/events');
+  es.addEventListener('transcript', (ev) => {
+    const obj = JSON.parse(ev.data);
+    pre.textContent = JSON.stringify(obj, null, 2) + '\n\n' + pre.textContent;
+  });
+}
+
+async function init() { await loadStatus(); await loadConfig(); await loadModels(); connectEvents(); }
+init().catch(e => showResult(String(e)));
+</script>
+</body>
+</html>

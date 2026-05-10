@@ -1,0 +1,21 @@
+services:
+  audio2mqtt:
+    build: .
+    image: audio2mqtt:local
+    container_name: audio2mqtt
+    env_file: .env
+    ports:
+      - "15000:15000"
+      - "8080:8080"
+    volumes:
+      - ./models:/models
+      - ./output:/output
+      - ./config:/config
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: 1
+              capabilities: [gpu]
+    restart: unless-stopped
