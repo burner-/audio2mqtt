@@ -2,23 +2,14 @@
 
 Version: 1.5.0
 
-`audio2mqtt` receives a continuous Windows FFmpeg audio stream, performs local speech recognition in a Docker container, and publishes transcript JSON to stdout, a JSONL file, MQTT and/or webhooks.
+`audio2mqtt` receives a continuous FFmpeg audio stream, performs local speech recognition in a Docker container, and publishes transcript JSON to stdout, a JSONL file, MQTT and/or webhooks.
 
 
-## What changed in 1.5
-
-- Web admin UI is now fully English.
-- Transcript JSON schema now uses a stable `source` object shape for stream and REST inputs.
-- Added runtime logging settings in the web UI.
-- Frame-level VAD debug logging is disabled by default and can be enabled explicitly.
-- Added REST transcription endpoint: `POST /api/transcribe`.
-- REST requests support a `context` JSON object that is copied to the transcript event.
-- Output events include source metadata such as `source.type`, `source.src` and `source.meta`.
 
 ## Pipeline
 
 ```text
-Windows DirectShow audio device
+Audio device
   -> FFmpeg
   -> TCP raw PCM 16 kHz mono s16le
   -> Docker container: audio2mqtt
@@ -31,6 +22,7 @@ Windows DirectShow audio device
 ```
 
 ## Start
+Tested only in Windows. Feel free to test in Linux and make pull request for documentation and scripts :) 
 
 From PowerShell in the project root:
 
