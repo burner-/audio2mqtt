@@ -119,6 +119,7 @@
 <script>
 let cfg = null;
 let modelsState = null;
+let modelBusy = {};
 
 function showResult(obj) {
   document.getElementById('result').textContent = typeof obj === 'string' ? obj : JSON.stringify(obj, null, 2);
@@ -136,25 +137,38 @@ async function loadStatus() {
 async function loadModels() {
   const r = await fetch('/api/models');
   modelsState = await r.json();
+  renderModels();
+}
+
+function renderModels(selectedId) {
   const select = document.getElementById('modelSelect');
+  const currentSelection = selectedId || select.value || modelsState?.active_model_id;
   select.innerHTML = '';
   for (const m of modelsState.profiles || []) {
     const opt = document.createElement('option');
     opt.value = m.id;
-    opt.textContent = `${m.name} (${m.exists ? 'downloaded' : 'missing'})`;
-    if (m.active) opt.selected = true;
+    opt.textContent = `${m.name} (${modelBusy[m.id] || (m.exists ? 'downloaded' : 'missing')})`;
+    if (m.id === currentSelection || (!currentSelection && m.active)) opt.selected = true;
     select.appendChild(opt);
   }
   document.getElementById('modelList').innerHTML = (modelsState.profiles || []).map(m => `
     <div class="model-item">
       <b>${m.name}</b>
       ${m.active ? '<span class="pill ok">active</span>' : ''}
-      ${m.exists ? '<span class="pill ok">downloaded</span>' : '<span class="pill warn">missing</span>'}
+      ${modelStatusPill(m)}
       ${m.recommended_vram_gb ? `<span class="pill">${m.recommended_vram_gb} GB+ VRAM</span>` : ''}
       <div class="small">id: ${m.id}</div>
       <div class="small">path: ${m.path}</div>
       <div class="small">${m.description || ''}</div>
     </div>`).join('');
+}
+
+function modelStatusPill(m) {
+  const busy = modelBusy[m.id];
+  if (busy === 'downloading') return '<span class="pill warn">downloading</span>';
+  if (busy === 'activating') return '<span class="pill warn">activating</span>';
+  if (busy === 'error') return '<span class="pill bad">error</span>';
+  return m.exists ? '<span class="pill ok">downloaded</span>' : '<span class="pill warn">missing</span>';
 }
 
 async function loadConfig() {
@@ -242,30 +256,41 @@ function readConfigFromForm() {
   };
 }
 
-async function saveConfig() {
+async function saveConfig(options = {}) {
   const body = readConfigFromForm();
   const r = await fetch('/api/config', { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify(body) });
   const out = await r.json();
-  showResult(out);
-  await loadConfig(); await loadModels(); await loadStatus();
+  if (options.showResult !== false) showResult(out);
+  if (options.refresh !== false) await loadConfig(); await loadModels(); await loadStatus();
+  return out;
 }
 
 async function downloadSelectedModel() {
-  await saveConfig();
   const id = document.getElementById('modelSelect').value;
-  showResult(`Downloading model ${id}. Large downloads can take a while.`);
+  modelBusy[id] = 'downloading';
+  renderModels(id);
+  await saveConfig({ refresh: false, showResult: false });
   const r = await fetch('/api/models/download', { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({id}) });
-  showResult(await r.json());
+  const out = await r.json();
+  modelBusy[id] = out.ok ? null : 'error';
+  showResult(out);
   await loadModels(); await loadStatus();
+  if (modelBusy[id] === null) delete modelBusy[id];
+  renderModels(id);
 }
 
 async function activateSelectedModel() {
-  await saveConfig();
   const id = document.getElementById('modelSelect').value;
-  showResult(`Activating model ${id}. It will be downloaded first if missing.`);
+  modelBusy[id] = 'activating';
+  renderModels(id);
+  await saveConfig({ refresh: false, showResult: false });
   const r = await fetch('/api/models/activate', { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({id, download_if_missing: true}) });
-  showResult(await r.json());
+  const out = await r.json();
+  modelBusy[id] = out.ok ? null : 'error';
+  showResult(out);
   await loadConfig(); await loadModels(); await loadStatus();
+  if (modelBusy[id] === null) delete modelBusy[id];
+  renderModels(id);
 }
 
 async function addHuggingFaceModel() {
@@ -274,7 +299,7 @@ async function addHuggingFaceModel() {
     showResult('Enter a Hugging Face repo name, for example Finnish-NLP/Finnish-finetuned-whisper-models-ggml-format.');
     return;
   }
-  await saveConfig();
+  await saveConfig({ refresh: false, showResult: false });
   const body = {
     repo_id: repo,
     filename: document.getElementById('hfFilename').value.trim() || null,
