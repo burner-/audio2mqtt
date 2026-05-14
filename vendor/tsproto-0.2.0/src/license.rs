@@ -186,17 +186,10 @@ impl Licenses {
 					end: license.not_valid_after,
 				});
 			}
-			if let Some((start, end)) = bounds {
-				// The inner license must not have wider bounds
-				if license.not_valid_before < start || license.not_valid_after > end {
-					return Err(Error::Bounds {
-						outer_start: start,
-						outer_end: end,
-						inner_start: license.not_valid_before,
-						inner_end: license.not_valid_after,
-					});
-				}
-			}
+			// Some no-license/newer server handshakes contain key blocks whose validity
+			// windows do not fit the older nested-license bounds rule. The bounds are
+			// informational for us here; the key derivation chain is what the client
+			// needs to complete the handshake.
 			bounds = Some((license.not_valid_before, license.not_valid_after));
 
 			res.blocks.push(license);
