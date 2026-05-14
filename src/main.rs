@@ -48,7 +48,11 @@ const SAMPLE_RATE: usize = 16_000;
 const BYTES_PER_SAMPLE: usize = 2;
 const VAD_FRAME_SAMPLES: usize = 512;
 const TEAMSPEAK_SAMPLE_RATE: usize = 48_000;
-const TEAMSPEAK_FRAME_SAMPLES: usize = 960;
+const TEAMSPEAK_DECODED_CHANNELS: usize = 2;
+const TEAMSPEAK_DOWNSAMPLE_RATIO: usize = TEAMSPEAK_SAMPLE_RATE / SAMPLE_RATE;
+const TEAMSPEAK_FRAME_SAMPLES_PER_CHANNEL: usize = TEAMSPEAK_SAMPLE_RATE / 50;
+const TEAMSPEAK_FRAME_BUFFER_SAMPLES: usize =
+    TEAMSPEAK_FRAME_SAMPLES_PER_CHANNEL * TEAMSPEAK_DECODED_CHANNELS;
 
 #[derive(Debug, Clone)]
 struct EnvConfig {
@@ -1453,8 +1457,11 @@ async fn run_teamspeak_session(
                 }
             }
             _ = audio_tick.tick() => {
-                let mut output = vec![0.0f32; TEAMSPEAK_FRAME_SAMPLES];
+                let mut output = vec![0.0f32; TEAMSPEAK_FRAME_BUFFER_SAMPLES];
                 let ended = audio_handler.fill_buffer_with_proc(&mut output, |client_id, samples| {
+                    if samples.is_empty() {
+                        return;
+                    }
                     let source = teamspeak_source_for_client(&cfg, client_id, &speakers);
                     let mono_16k = downsample_teamspeak_to_asr(samples);
                     if !segmenters.contains_key(client_id) {
@@ -1534,8 +1541,22 @@ async fn run_teamspeak_session(
                     }
                     Ok(StreamItem::Audio(packet)) => {
                         if let Some(from) = teamspeak_audio_sender(&packet) {
-                            if let Err(e) = audio_handler.handle_packet(from, packet) {
-                                warn!(client_id = ?from, error = %e, "failed to handle TeamSpeak audio packet");
+                            match audio_handler.handle_packet(from, packet) {
+                                Ok(_) => {}
+                                Err(e) if teamspeak_audio_error_resets_stream(&e) => {
+                                    audio_handler.get_mut_queues().remove(&from);
+                                    if let Some(mut segmenter) = segmenters.remove(&from) {
+                                        if let Err(flush_error) =
+                                            segmenter.finish_blocking(&runtime_config, &job_tx)
+                                        {
+                                            warn!(client_id = ?from, error = %flush_error, "failed to flush TeamSpeak audio segment after queue reset");
+                                        }
+                                    }
+                                    warn!(client_id = ?from, error = %e, "reset TeamSpeak audio stream after jitter buffer drift");
+                                }
+                                Err(e) => {
+                                    warn!(client_id = ?from, error = %e, "failed to handle TeamSpeak audio packet");
+                                }
                             }
                         }
                     }
@@ -1649,16 +1670,29 @@ fn teamspeak_source_for_client(
             "channel_path": meta.channel_path,
             "sample_rate_original": TEAMSPEAK_SAMPLE_RATE,
             "sample_rate": SAMPLE_RATE,
+            "channels_original": TEAMSPEAK_DECODED_CHANNELS,
             "channels": 1
         }),
     }
 }
 
+fn teamspeak_audio_error_resets_stream(error: &tsclientlib::audio::Error) -> bool {
+    matches!(
+        error,
+        tsclientlib::audio::Error::QueueFull | tsclientlib::audio::Error::TooLate { .. }
+    )
+}
+
 fn downsample_teamspeak_to_asr(samples: &[f32]) -> Vec<f32> {
     samples
-        .chunks(3)
-        .filter(|chunk| chunk.len() == 3)
-        .map(|chunk| (chunk[0] + chunk[1] + chunk[2]) / 3.0)
+        .chunks_exact(TEAMSPEAK_DOWNSAMPLE_RATIO * TEAMSPEAK_DECODED_CHANNELS)
+        .map(|chunk| {
+            let mono_sum: f32 = chunk
+                .chunks_exact(TEAMSPEAK_DECODED_CHANNELS)
+                .map(|frame| frame.iter().sum::<f32>() / TEAMSPEAK_DECODED_CHANNELS as f32)
+                .sum();
+            mono_sum / TEAMSPEAK_DOWNSAMPLE_RATIO as f32
+        })
         .collect()
 }
 
