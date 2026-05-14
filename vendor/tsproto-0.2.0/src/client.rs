@@ -452,8 +452,20 @@ impl Client {
 			// Parse license argument. Even unlicensed servers still need the license
 			// blob's key material to derive the server ephemeral key.
 			dump_license_blob_if_requested(&self.con.logger, &l);
-			let licenses = Licenses::parse(&l).map_err(Error::ParseLicense)?;
-			let server_ek = licenses.derive_public_key(root).map_err(Error::ParseLicense)?;
+			let licenses = match Licenses::parse(&l) {
+				Ok(licenses) => licenses,
+				Err(e) => {
+					dump_license_blob(&self.con.logger, &l, &format!("parse failed: {e}"));
+					return Err(Error::ParseLicense(e));
+				}
+			};
+			let server_ek = match licenses.derive_public_key(root) {
+				Ok(server_ek) => server_ek,
+				Err(e) => {
+					dump_license_blob(&self.con.logger, &l, &format!("derive public key failed: {e}"));
+					return Err(Error::ParseLicense(e));
+				}
+			};
 
 			// Create own ephemeral key
 			let ek = EccKeyPrivEd25519::create();
@@ -690,15 +702,20 @@ impl DerefMut for Client {
 
 fn dump_license_blob_if_requested(logger: &Logger, license: &[u8]) {
 	if std::env::var("TSPROTO_DUMP_LICENSE").map(|v| v != "0").unwrap_or(false) {
-		warn!(
-			logger,
-			"TeamSpeak license blob dump";
-			"len" => license.len(),
-			"base64" => base64::encode(license),
-			"hex" => bytes_to_hex(license),
-			"candidates" => scan_license_block_candidates(license).join("; ")
-		);
+		dump_license_blob(logger, license, "requested by TSPROTO_DUMP_LICENSE");
 	}
+}
+
+fn dump_license_blob(logger: &Logger, license: &[u8], reason: &str) {
+	warn!(
+		logger,
+		"TeamSpeak license blob dump";
+		"reason" => reason,
+		"len" => license.len(),
+		"base64" => base64::encode(license),
+		"hex" => bytes_to_hex(license),
+		"candidates" => scan_license_block_candidates(license).join("; ")
+	);
 }
 
 fn bytes_to_hex(data: &[u8]) -> String {
