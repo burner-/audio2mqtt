@@ -1412,7 +1412,6 @@ async fn run_teamspeak_session(
     let mut audio_handler = tsclientlib::audio::AudioHandler::<ClientId>::new(logger);
     let mut segmenters: HashMap<ClientId, AudioSegmenter> = HashMap::new();
     let mut speakers: HashMap<ClientId, TeamSpeakSpeakerMeta> = HashMap::new();
-    let mut channels_by_id: HashMap<u64, TeamSpeakChannelInfo> = HashMap::new();
     let mut audio_tick = time::interval(Duration::from_millis(20));
 
     loop {
@@ -1464,7 +1463,10 @@ async fn run_teamspeak_session(
                     }
                 }
             }
-            event = con.events().next() => {
+            event = async {
+                let mut events = con.events();
+                events.next().await
+            } => {
                 let Some(event) = event else {
                     return TeamSpeakSessionEnd::Reconnect;
                 };
@@ -1472,11 +1474,19 @@ async fn run_teamspeak_session(
                     Ok(StreamItem::BookEvents(_)) => {
                         if let Ok(state) = con.get_state() {
                             let channels = collect_teamspeak_channels(state);
-                            channels_by_id = channels.iter().map(|c| (c.id, c.clone())).collect();
-                            speakers = state.clients.iter()
-                                .map(|(id, client)| (*id, teamspeak_speaker_meta(client, &channels_by_id)))
+                            let channels_by_id: HashMap<u64, TeamSpeakChannelInfo> =
+                                channels.iter().map(|c| (c.id, c.clone())).collect();
+                            speakers = state
+                                .clients
+                                .iter()
+                                .map(|(id, client)| {
+                                    (*id, teamspeak_speaker_meta(client, &channels_by_id))
+                                })
                                 .collect();
-                            let own_channel = state.clients.get(&state.own_client).and_then(|c| channels_by_id.get(&channel_id_u64(c.channel)));
+                            let own_channel = state
+                                .clients
+                                .get(&state.own_client)
+                                .and_then(|c| channels_by_id.get(&channel_id_u64(c.channel)));
                             let configured_path_exists = !cfg.channel_path.trim().is_empty()
                                 && channels.iter().any(|channel| channel.path == cfg.channel_path);
                             let configured_id_exists = cfg.channel_id
