@@ -318,7 +318,10 @@ impl License {
 				(InnerLicense::Server { issuer, license_type, data: license_data }, 6 + len)
 			}
 			32 => (InnerLicense::Ephemeral, 0),
-			i => (InnerLicense::Unknown { block_type: i }, 0),
+			i => {
+				let all_len = infer_unknown_license_block_len(data);
+				(InnerLicense::Unknown { block_type: i }, all_len - MIN_LEN)
+			}
 		};
 
 		let all_len = MIN_LEN + extra_len;
@@ -413,6 +416,34 @@ impl License {
 		let hash_key = self.get_hash_key();
 		Ok(EccKeyPrivEd25519(priv_key * hash_key + parent_key.0))
 	}
+}
+
+fn infer_unknown_license_block_len(data: &[u8]) -> usize {
+	const MIN_LEN: usize = 42;
+
+	for next_start in MIN_LEN..data.len().saturating_sub(MIN_LEN) {
+		if looks_like_license_block_start(&data[next_start..]) {
+			return next_start;
+		}
+	}
+
+	data.len()
+}
+
+fn looks_like_license_block_start(data: &[u8]) -> bool {
+	const MIN_LEN: usize = 42;
+	if data.len() < MIN_LEN || data[0] != 0 {
+		return false;
+	}
+
+	let block_type = data[33];
+	if !matches!(block_type, 0 | 1 | 2 | 3 | 8 | 32) {
+		return false;
+	}
+
+	let before_ts = u32::from_be_bytes([data[34], data[35], data[36], data[37]]);
+	let after_ts = u32::from_be_bytes([data[38], data[39], data[40], data[41]]);
+	before_ts <= after_ts
 }
 
 impl fmt::Debug for License {
