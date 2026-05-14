@@ -199,6 +199,14 @@ TSPROTO_DUMP_LICENSE=1
 
 This writes one raw license blob dump to the container logs during connection setup. Disable it after collecting the log because the dump is verbose.
 
+The patched `tsproto` also supports alternate license key derivation modes via:
+
+```text
+TSPROTO_LICENSE_DERIVE_MODE=ignore-unknown
+```
+
+Available debug modes are `full`, `ignore-unknown`, `last-direct`, `unknown-direct` and `root-plus-unknown`. `ignore-unknown` is used in `docker-compose.yml` while testing unlicensed/newer TeamSpeak server handshakes.
+
 In the web admin:
 
 - set the TeamSpeak server address, nickname and optional passwords

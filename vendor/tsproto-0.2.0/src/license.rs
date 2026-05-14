@@ -208,6 +208,20 @@ impl Licenses {
 	}
 
 	pub fn derive_public_key(&self, root: EccKeyPubEd25519) -> Result<EdwardsPoint> {
+		self.derive_public_key_with_mode(root, "full")
+	}
+
+	pub fn derive_public_key_with_mode(&self, root: EccKeyPubEd25519, mode: &str) -> Result<EdwardsPoint> {
+		match mode {
+			"ignore-unknown" | "skip-unknown" | "first-only" => self.derive_public_key_skip_unknown(root),
+			"last-direct" => self.derive_public_key_last_direct(),
+			"unknown-direct" => self.derive_public_key_unknown_direct(),
+			"root-plus-unknown" => self.derive_public_key_root_plus_unknown(root),
+			_ => self.derive_public_key_full(root),
+		}
+	}
+
+	fn derive_public_key_full(&self, root: EccKeyPubEd25519) -> Result<EdwardsPoint> {
 		let mut last_round = root.0.decompress().ok_or(Error::InvalidRootKey)?;
 		for l in &self.blocks {
 			//let derived_key = last_round.compress().0;
@@ -217,6 +231,43 @@ impl Licenses {
 		//let derived_key = last_round.compress().0;
 		//println!("Got end key: {:?}", ::utils::HexSlice((&derived_key) as &[u8]));
 		Ok(last_round)
+	}
+
+	fn derive_public_key_skip_unknown(&self, root: EccKeyPubEd25519) -> Result<EdwardsPoint> {
+		let mut last_round = root.0.decompress().ok_or(Error::InvalidRootKey)?;
+		for l in &self.blocks {
+			if matches!(l.inner, InnerLicense::Unknown { .. }) {
+				continue;
+			}
+			last_round = l.derive_public_key(&last_round)?;
+		}
+		Ok(last_round)
+	}
+
+	fn derive_public_key_last_direct(&self) -> Result<EdwardsPoint> {
+		self.blocks
+			.last()
+			.ok_or(Error::TooShort)?
+			.key
+			.get_pub()
+	}
+
+	fn derive_public_key_unknown_direct(&self) -> Result<EdwardsPoint> {
+		self.blocks
+			.iter()
+			.find(|l| matches!(l.inner, InnerLicense::Unknown { .. }))
+			.ok_or(Error::UnknownBlockType(0))?
+			.key
+			.get_pub()
+	}
+
+	fn derive_public_key_root_plus_unknown(&self, root: EccKeyPubEd25519) -> Result<EdwardsPoint> {
+		let root = root.0.decompress().ok_or(Error::InvalidRootKey)?;
+		self.blocks
+			.iter()
+			.find(|l| matches!(l.inner, InnerLicense::Unknown { .. }))
+			.ok_or(Error::UnknownBlockType(0))?
+			.derive_public_key(&root)
 	}
 
 	/// Derive the private key of this license, starting with a specific block.

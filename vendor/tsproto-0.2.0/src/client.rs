@@ -459,7 +459,9 @@ impl Client {
 					return Err(Error::ParseLicense(e));
 				}
 			};
-			let server_ek = match licenses.derive_public_key(root) {
+			let derive_mode = std::env::var("TSPROTO_LICENSE_DERIVE_MODE")
+				.unwrap_or_else(|_| "full".to_string());
+			let server_ek = match licenses.derive_public_key_with_mode(root, &derive_mode) {
 				Ok(server_ek) => server_ek,
 				Err(e) => {
 					dump_license_blob(&self.con.logger, &l, &format!("derive public key failed: {e}"));
