@@ -6,7 +6,7 @@ services:
     env_file: .env
     environment:
       TSPROTO_DUMP_LICENSE: "1"
-      TSPROTO_LICENSE_DERIVE_MODE: "ignore-unknown"
+      TSPROTO_LICENSE_DERIVE_MODE: "unknown-direct"
     ports:
       - "15000:15000"
       - "8080:8080"
