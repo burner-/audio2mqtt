@@ -287,15 +287,8 @@ impl License {
 		let (inner, extra_len) = match data[33] {
 			0 => {
 				let license_data: u32 = (&data[42..]).read_be().map_err(Error::Deserialize)?;
-				let len = if let Some(len) = data[46..].iter().position(|&b| b == 0) {
-					len
-				} else {
-					return Err(Error::NonterminatedString);
-				};
-				let issuer = str::from_utf8(&data[46..46 + len])
-					.map_err(Error::DeserializeString)?
-					.to_string();
-				(InnerLicense::Intermediate { issuer, data: license_data }, 5 + len)
+				let (issuer, all_len) = parse_license_string_lossy(data, 46)?;
+				(InnerLicense::Intermediate { issuer, data: license_data }, all_len - MIN_LEN)
 			}
 			2 => {
 				if data.len() < 47 {
@@ -304,18 +297,8 @@ impl License {
 				let license_type =
 					LicenseType::from_u8(data[42]).ok_or(Error::UnknownLicenseType(data[42]))?;
 				let license_data: u32 = (&data[43..]).read_be().map_err(Error::Deserialize)?;
-				let len = if let Some(len) = data[47..].iter().position(|&b| b == 0) {
-					len
-				} else {
-					return Err(Error::NonterminatedString);
-				};
-				if data.len() < 47 + len {
-					return Err(Error::TooShort);
-				}
-				let issuer = str::from_utf8(&data[47..47 + len])
-					.map_err(Error::DeserializeString)?
-					.to_string();
-				(InnerLicense::Server { issuer, license_type, data: license_data }, 6 + len)
+				let (issuer, all_len) = parse_license_string_lossy(data, 47)?;
+				(InnerLicense::Server { issuer, license_type, data: license_data }, all_len - MIN_LEN)
 			}
 			32 => (InnerLicense::Ephemeral, 0),
 			i => {
@@ -428,6 +411,25 @@ fn infer_unknown_license_block_len(data: &[u8]) -> usize {
 	}
 
 	data.len()
+}
+
+fn parse_license_string_lossy(data: &[u8], start: usize) -> Result<(String, usize)> {
+	if data.len() < start {
+		return Err(Error::TooShort);
+	}
+
+	let (string_end, all_len) = if let Some(len) = data[start..].iter().position(|&b| b == 0) {
+		(start + len, start + len + 1)
+	} else {
+		let all_len = infer_unknown_license_block_len(data);
+		if all_len < start {
+			return Err(Error::TooShort);
+		}
+		(all_len, all_len)
+	};
+
+	let issuer = String::from_utf8_lossy(&data[start..string_end]).to_string();
+	Ok((issuer, all_len))
 }
 
 fn looks_like_license_block_start(data: &[u8]) -> bool {
