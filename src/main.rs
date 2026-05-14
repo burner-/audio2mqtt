@@ -1364,6 +1364,26 @@ async fn run_teamspeak_manager(
                 time::sleep(Duration::from_secs(cfg.reconnect_seconds)).await;
             }
             TeamSpeakSessionEnd::Fatal(err) => {
+                if is_unsupported_teamspeak_license_error(&err) {
+                    update_teamspeak_status(&status, |s| {
+                        s.state = "unsupported_server_license".to_string();
+                        s.enabled = cfg.enabled;
+                        s.connected = false;
+                        s.connected_at = None;
+                        s.last_error = Some(format!(
+                            "{err}. The current tsclientlib/tsproto stack could not parse this server's license handshake."
+                        ));
+                    });
+                    match command_rx.recv().await {
+                        Some(TeamSpeakCommand::Apply(new_cfg)) => cfg = new_cfg.normalized(),
+                        Some(TeamSpeakCommand::Connect) | Some(TeamSpeakCommand::Reconnect) => {
+                            cfg = runtime_config.read().unwrap().teamspeak.clone().normalized();
+                        }
+                        Some(TeamSpeakCommand::Disconnect) => cfg.enabled = false,
+                        None => break,
+                    }
+                    continue;
+                }
                 let reconnect_seconds = cfg.reconnect_seconds;
                 update_teamspeak_status(&status, |s| {
                     s.state = "error".to_string();
@@ -1741,6 +1761,11 @@ fn channel_id_u64(id: ChannelId) -> u64 {
 
 fn client_id_u64(id: ClientId) -> u64 {
     id.0 as u64
+}
+
+fn is_unsupported_teamspeak_license_error(error: &str) -> bool {
+    let normalized = error.to_ascii_lowercase();
+    normalized.contains("failed to parse license") || normalized.contains("intermediate license")
 }
 
 fn current_transcription_settings(runtime_config: &Arc<RwLock<RuntimeConfig>>) -> (TranscriptionConfig, bool) {

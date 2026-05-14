@@ -15,6 +15,7 @@ ENV PATH=/root/.cargo/bin:${PATH}
 
 WORKDIR /app
 COPY Cargo.toml ./
+COPY vendor ./vendor
 COPY src ./src
 COPY static ./static
 

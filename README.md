@@ -189,6 +189,8 @@ The TeamSpeak receiver connects as a normal client to an external TeamSpeak serv
 
 The Docker image includes Opus runtime libraries for TeamSpeak audio decoding.
 
+This build uses a local `tsproto` patch under `vendor/tsproto-0.2.0`. The patch accepts intermediate TeamSpeak license handshake data larger than `0x7f`, which is needed for servers that report no server license and otherwise fail with `Failed to parse license: Invalid data 0x104 in intermediate license`.
+
 In the web admin:
 
 - set the TeamSpeak server address, nickname and optional passwords

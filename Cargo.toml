@@ -26,6 +26,9 @@ uuid = { version = "1.10", features = ["v4", "serde"] }
 voice_activity_detector = { version = "0.2.1", features = ["load-dynamic"] }
 whisper-rs = { version = "0.16", features = ["cuda", "tracing_backend"] }
 
+[patch.crates-io]
+tsproto = { path = "vendor/tsproto-0.2.0" }
+
 [profile.release]
 lto = "thin"
 codegen-units = 1
