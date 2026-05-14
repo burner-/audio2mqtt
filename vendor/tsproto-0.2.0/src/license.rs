@@ -431,6 +431,12 @@ fn looks_like_license_block_start(data: &[u8]) -> bool {
 		return false;
 	}
 
+	let mut key_data = [0; 32];
+	key_data.copy_from_slice(&data[1..33]);
+	if EccKeyPubEd25519::from_bytes(key_data).0.decompress().is_none() {
+		return false;
+	}
+
 	let block_type = data[33];
 	if !matches!(block_type, 0 | 1 | 2 | 3 | 8 | 32) {
 		return false;

@@ -4,6 +4,8 @@ services:
     image: audio2mqtt:local
     container_name: audio2mqtt
     env_file: .env
+    environment:
+      TSPROTO_DUMP_LICENSE: "1"
     ports:
       - "15000:15000"
       - "8080:8080"

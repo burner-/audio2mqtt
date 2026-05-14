@@ -1,0 +1,16 @@
+# Local runtime configuration and secrets
+.env
+.env.*
+config/config.json
+
+# Build output
+target/
+
+# Runtime output and downloaded models
+output/
+models/*.bin
+models/*.tmp-download
+
+# Temporary local artifacts
+*.tmp
+*.log

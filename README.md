@@ -191,6 +191,14 @@ The Docker image includes Opus runtime libraries for TeamSpeak audio decoding.
 
 This build uses a local `tsproto` patch under `vendor/tsproto-0.2.0`. The patch accepts intermediate TeamSpeak license handshake data larger than `0x7f`, which is needed for servers that report no server license and otherwise fail with `Failed to parse license: Invalid data 0x104 in intermediate license`.
 
+For debugging TeamSpeak license handshake parsing, start the container with:
+
+```text
+TSPROTO_DUMP_LICENSE=1
+```
+
+This writes one raw license blob dump to the container logs during connection setup. Disable it after collecting the log because the dump is verbose.
+
 In the web admin:
 
 - set the TeamSpeak server address, nickname and optional passwords

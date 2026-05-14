@@ -451,6 +451,7 @@ impl Client {
 
 			// Parse license argument. Even unlicensed servers still need the license
 			// blob's key material to derive the server ephemeral key.
+			dump_license_blob_if_requested(&self.con.logger, &l);
 			let licenses = Licenses::parse(&l).map_err(Error::ParseLicense)?;
 			let server_ek = licenses.derive_public_key(root).map_err(Error::ParseLicense)?;
 
@@ -685,6 +686,64 @@ impl Deref for Client {
 
 impl DerefMut for Client {
 	fn deref_mut(&mut self) -> &mut Self::Target { &mut self.con }
+}
+
+fn dump_license_blob_if_requested(logger: &Logger, license: &[u8]) {
+	if std::env::var("TSPROTO_DUMP_LICENSE").map(|v| v != "0").unwrap_or(false) {
+		warn!(
+			logger,
+			"TeamSpeak license blob dump";
+			"len" => license.len(),
+			"base64" => base64::encode(license),
+			"hex" => bytes_to_hex(license),
+			"candidates" => scan_license_block_candidates(license).join("; ")
+		);
+	}
+}
+
+fn bytes_to_hex(data: &[u8]) -> String {
+	const HEX: &[u8; 16] = b"0123456789abcdef";
+	let mut out = String::with_capacity(data.len() * 2);
+	for &byte in data {
+		out.push(HEX[(byte >> 4) as usize] as char);
+		out.push(HEX[(byte & 0x0f) as usize] as char);
+	}
+	out
+}
+
+fn scan_license_block_candidates(data: &[u8]) -> Vec<String> {
+	const MIN_BLOCK_LEN: usize = 42;
+	if data.is_empty() {
+		return vec!["empty".to_string()];
+	}
+
+	let mut out = vec![format!("version@0={}", data[0])];
+	for offset in 1..data.len().saturating_sub(MIN_BLOCK_LEN) {
+		if data[offset] != 0 {
+			continue;
+		}
+
+		let block = &data[offset..];
+		let block_type = block[33];
+		let before_ts = u32::from_be_bytes([block[34], block[35], block[36], block[37]]);
+		let after_ts = u32::from_be_bytes([block[38], block[39], block[40], block[41]]);
+		let mut key_data = [0; 32];
+		key_data.copy_from_slice(&block[1..33]);
+		let key_ok = EccKeyPubEd25519::from_bytes(key_data).0.decompress().is_some();
+		let next_null = block[42..]
+			.iter()
+			.position(|&byte| byte == 0)
+			.map(|pos| pos + 42);
+
+		out.push(format!(
+			"off={offset} type={block_type} key_ok={key_ok} before=0x{before_ts:08x} after=0x{after_ts:08x} next_null={}",
+			next_null
+				.map(|pos| pos.to_string())
+				.unwrap_or_else(|| "none".to_string())
+		));
+	}
+
+	out
 }
 
 /// Return queued errors and inspect packets.
