@@ -1,8 +1,6 @@
 use std::borrow::Cow;
 use std::fmt;
 use std::io::prelude::*;
-use std::str;
-
 use curve25519_dalek::constants;
 use curve25519_dalek::edwards::EdwardsPoint;
 use curve25519_dalek::scalar::Scalar;
@@ -293,11 +291,9 @@ impl License {
 				let (issuer, all_len) = parse_license_string_lossy(data, 47)?;
 				(InnerLicense::Server { issuer, license_type, data: license_data }, all_len - MIN_LEN)
 			}
+			8 => (InnerLicense::Unknown { block_type: 8 }, data.len() - MIN_LEN),
 			32 => (InnerLicense::Ephemeral, 0),
-			i => {
-				let all_len = infer_unknown_license_block_len(data);
-				(InnerLicense::Unknown { block_type: i }, all_len - MIN_LEN)
-			}
+			i => return Err(Error::UnknownBlockType(i)),
 		};
 
 		let all_len = MIN_LEN + extra_len;
@@ -394,18 +390,6 @@ impl License {
 	}
 }
 
-fn infer_unknown_license_block_len(data: &[u8]) -> usize {
-	const MIN_LEN: usize = 42;
-
-	for next_start in MIN_LEN..data.len().saturating_sub(MIN_LEN) {
-		if looks_like_license_block_start(&data[next_start..]) {
-			return next_start;
-		}
-	}
-
-	data.len()
-}
-
 fn parse_license_string_lossy(data: &[u8], start: usize) -> Result<(String, usize)> {
 	if data.len() < start {
 		return Err(Error::TooShort);
@@ -414,37 +398,11 @@ fn parse_license_string_lossy(data: &[u8], start: usize) -> Result<(String, usiz
 	let (string_end, all_len) = if let Some(len) = data[start..].iter().position(|&b| b == 0) {
 		(start + len, start + len + 1)
 	} else {
-		let all_len = infer_unknown_license_block_len(data);
-		if all_len < start {
-			return Err(Error::TooShort);
-		}
-		(all_len, all_len)
+		(data.len(), data.len())
 	};
 
 	let issuer = String::from_utf8_lossy(&data[start..string_end]).to_string();
 	Ok((issuer, all_len))
-}
-
-fn looks_like_license_block_start(data: &[u8]) -> bool {
-	const MIN_LEN: usize = 42;
-	if data.len() < MIN_LEN || data[0] != 0 {
-		return false;
-	}
-
-	let mut key_data = [0; 32];
-	key_data.copy_from_slice(&data[1..33]);
-	if EccKeyPubEd25519::from_bytes(key_data).0.decompress().is_none() {
-		return false;
-	}
-
-	let block_type = data[33];
-	if !matches!(block_type, 0 | 1 | 2 | 3 | 8 | 32) {
-		return false;
-	}
-
-	let before_ts = u32::from_be_bytes([data[34], data[35], data[36], data[37]]);
-	let after_ts = u32::from_be_bytes([data[38], data[39], data[40], data[41]]);
-	before_ts <= after_ts
 }
 
 impl fmt::Debug for License {
