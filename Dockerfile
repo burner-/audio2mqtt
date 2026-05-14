@@ -7,7 +7,7 @@ ARG ORT_VERSION
 
 ENV DEBIAN_FRONTEND=noninteractive
 RUN apt-get update && apt-get install -y --no-install-recommends \
-    ca-certificates curl git build-essential cmake pkg-config clang libclang-dev protobuf-compiler libssl-dev \
+    ca-certificates curl git build-essential cmake pkg-config clang libclang-dev protobuf-compiler libssl-dev libopus-dev \
     && rm -rf /var/lib/apt/lists/*
 
 RUN curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --profile minimal
@@ -27,7 +27,7 @@ ARG ORT_VERSION
 
 ENV DEBIAN_FRONTEND=noninteractive
 RUN apt-get update && apt-get install -y --no-install-recommends \
-    ca-certificates curl libgomp1 libssl3 \
+    ca-certificates curl libgomp1 libssl3 libopus0 \
     && rm -rf /var/lib/apt/lists/*
 
 # ONNX Runtime CPU shared library for Silero VAD.

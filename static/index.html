@@ -47,6 +47,20 @@
     <div class="row"><div><label>Min segment seconds</label><input id="minSegmentSeconds" type="number" min="0.1" step="0.1" /></div><div><label>Max segment seconds</label><input id="maxSegmentSeconds" type="number" min="0.1" step="0.1" /></div></div>
     <div class="row"><div><label>Silence cut seconds</label><input id="silenceCutSeconds" type="number" min="0.05" step="0.05" /></div><div><label>Pre-roll seconds</label><input id="preRollSeconds" type="number" min="0" step="0.05" /></div></div>
 
+    <h3>TeamSpeak input</h3>
+    <div id="teamspeakStatus" class="small">TeamSpeak: loading...</div>
+    <label><input id="teamspeakEnabled" type="checkbox" style="width:auto"> Enable TeamSpeak receiver</label>
+    <label>Server address</label><input id="teamspeakServer" placeholder="ts.example.com:9987" />
+    <div class="row"><div><label>Nickname</label><input id="teamspeakNickname" /></div><div><label>Reconnect seconds</label><input id="teamspeakReconnectSeconds" type="number" min="1" step="1" /></div></div>
+    <label>Server password</label><input id="teamspeakServerPassword" type="password" />
+    <label>Identity</label><textarea id="teamspeakIdentity" style="min-height:72px"></textarea>
+    <label>Channel</label><select id="teamspeakChannel"></select>
+    <label>Channel password</label><input id="teamspeakChannelPassword" type="password" />
+    <button class="secondary" onclick="connectTeamSpeak()">Connect</button>
+    <button class="secondary" onclick="disconnectTeamSpeak()">Disconnect</button>
+    <button class="secondary" onclick="reconnectTeamSpeak()">Reconnect / refresh channels</button>
+    <button class="secondary" onclick="selectTeamSpeakChannel()">Use selected channel</button>
+
     <h3>Model</h3>
     <label>Active / selectable model</label>
     <select id="modelSelect"></select>
@@ -120,6 +134,7 @@
 let cfg = null;
 let modelsState = null;
 let modelBusy = {};
+let teamspeakState = null;
 
 function showResult(obj) {
   document.getElementById('result').textContent = typeof obj === 'string' ? obj : JSON.stringify(obj, null, 2);
@@ -128,10 +143,15 @@ function showResult(obj) {
 async function loadStatus() {
   const r = await fetch('/api/status');
   const s = await r.json();
+  teamspeakState = s.teamspeak || null;
   const modelExists = s.active_model_exists ? '<span class="ok">available</span>' : '<span class="bad">missing</span>';
   const vadDebug = s.logging?.vad_debug ? '<span class="warn">on</span>' : '<span class="ok">off</span>';
+  const ts = s.teamspeak || {};
+  const tsStateClass = ts.connected ? 'ok' : (ts.state === 'disabled' ? 'small' : 'warn');
   const t = s.transcription || {};
   document.getElementById('status').innerHTML = `Status: <span class="ok">OK</span> v${s.version}<br>ASR: ${t.language || s.language || 'fi'}, ${t.n_threads || 8} threads, beam ${t.beam_size || 3}<br>VAD: ${s.vad_backend}, threshold ${t.vad_threshold ?? s.vad_threshold}<br>Active model: ${s.active_model_name} (${s.active_model_id}) - ${modelExists}<br>Path: ${s.active_model_path}<br>Input: ${s.asr_bind}<br>Output: ${s.output_jsonl}<br>Log level: ${s.logging?.level || 'info'}; VAD frame debug: ${vadDebug}`;
+  document.getElementById('teamspeakStatus').innerHTML = `TeamSpeak: <span class="${tsStateClass}">${ts.state || 'disabled'}</span><br>Server: ${ts.server_address || ''}<br>Channel: ${ts.active_channel_path || '-'}${ts.last_error ? `<br><span class="bad">${ts.last_error}</span>` : ''}`;
+  renderTeamSpeakChannels();
 }
 
 async function loadModels() {
@@ -177,6 +197,7 @@ async function loadConfig() {
   cfg.models = cfg.models || { active_model_id: 'large-v3', profiles: [] };
   cfg.logging = cfg.logging || { level: 'info', vad_debug: false };
   cfg.transcription = cfg.transcription || {};
+  cfg.teamspeak = cfg.teamspeak || {};
   document.getElementById('language').value = cfg.transcription.language || 'fi';
   document.getElementById('nThreads').value = cfg.transcription.n_threads ?? 8;
   document.getElementById('beamSize').value = cfg.transcription.beam_size ?? 3;
@@ -187,6 +208,13 @@ async function loadConfig() {
   document.getElementById('preRollSeconds').value = cfg.transcription.pre_roll_seconds ?? 0.4;
   document.getElementById('logLevel').value = cfg.logging.level || 'info';
   document.getElementById('vadDebug').checked = !!cfg.logging.vad_debug;
+  document.getElementById('teamspeakEnabled').checked = !!cfg.teamspeak.enabled;
+  document.getElementById('teamspeakServer').value = cfg.teamspeak.server_address || 'localhost:9987';
+  document.getElementById('teamspeakNickname').value = cfg.teamspeak.nickname || 'audio2mqtt';
+  document.getElementById('teamspeakReconnectSeconds').value = cfg.teamspeak.reconnect_seconds ?? 10;
+  document.getElementById('teamspeakServerPassword').value = cfg.teamspeak.server_password || '';
+  document.getElementById('teamspeakChannelPassword').value = cfg.teamspeak.channel_password || '';
+  document.getElementById('teamspeakIdentity').value = cfg.teamspeak.identity || '';
   document.getElementById('mqttEnabled').checked = cfg.mqtt.enabled;
   document.getElementById('mqttHost').value = cfg.mqtt.host || '';
   document.getElementById('mqttPort').value = cfg.mqtt.port || 1883;
@@ -197,6 +225,26 @@ async function loadConfig() {
   document.getElementById('mqttQos').value = String(cfg.mqtt.qos ?? 1);
   document.getElementById('webhooks').value = (cfg.webhooks || []).map(h => `${h.name}|${h.enabled}|${h.url}|${h.bearer_token || ''}`).join('\n');
   document.getElementById('modelsText').value = (cfg.models.profiles || []).map(m => `${m.id}|${m.name}|${m.path}|${m.url}|${m.recommended_vram_gb || ''}|${m.description || ''}`).join('\n');
+  renderTeamSpeakChannels();
+}
+
+function renderTeamSpeakChannels() {
+  const select = document.getElementById('teamspeakChannel');
+  if (!select) return;
+  const selected = String(cfg?.teamspeak?.channel_id || teamspeakState?.active_channel_id || '');
+  const channels = teamspeakState?.channels || [];
+  select.innerHTML = '';
+  const empty = document.createElement('option');
+  empty.value = '';
+  empty.textContent = channels.length ? 'Default / no channel selected' : 'Connect to fetch channels';
+  select.appendChild(empty);
+  for (const ch of channels) {
+    const opt = document.createElement('option');
+    opt.value = String(ch.id);
+    opt.textContent = `${ch.path || ch.name} (#${ch.id})`;
+    if (String(ch.id) === selected) opt.selected = true;
+    select.appendChild(opt);
+  }
 }
 
 function parseModelProfiles() {
@@ -252,6 +300,17 @@ function readConfigFromForm() {
     logging: {
       level: document.getElementById('logLevel').value || 'info',
       vad_debug: document.getElementById('vadDebug').checked
+    },
+    teamspeak: {
+      enabled: document.getElementById('teamspeakEnabled').checked,
+      server_address: document.getElementById('teamspeakServer').value || 'localhost:9987',
+      server_password: document.getElementById('teamspeakServerPassword').value || null,
+      nickname: document.getElementById('teamspeakNickname').value || 'audio2mqtt',
+      identity: document.getElementById('teamspeakIdentity').value || '',
+      channel_id: cfg?.teamspeak?.channel_id || null,
+      channel_path: cfg?.teamspeak?.channel_path || '',
+      channel_password: document.getElementById('teamspeakChannelPassword').value || null,
+      reconnect_seconds: numberValue('teamspeakReconnectSeconds', 10)
     }
   };
 }
@@ -319,6 +378,20 @@ async function addHuggingFaceModel() {
 
 async function testMqtt() { await saveConfig(); const r = await fetch('/api/test/mqtt', { method: 'POST' }); showResult(await r.json()); }
 async function testWebhook() { await saveConfig(); const r = await fetch('/api/test/webhook', { method: 'POST' }); showResult(await r.json()); }
+async function connectTeamSpeak() { await saveConfig({ refresh: false }); const r = await fetch('/api/teamspeak/connect', { method: 'POST' }); showResult(await r.json()); await loadConfig(); await loadStatus(); }
+async function disconnectTeamSpeak() { const r = await fetch('/api/teamspeak/disconnect', { method: 'POST' }); showResult(await r.json()); await loadConfig(); await loadStatus(); }
+async function reconnectTeamSpeak() { await saveConfig({ refresh: false }); const r = await fetch('/api/teamspeak/reconnect', { method: 'POST' }); showResult(await r.json()); await loadConfig(); await loadStatus(); }
+async function selectTeamSpeakChannel() {
+  const id = Number(document.getElementById('teamspeakChannel').value);
+  if (!id) {
+    showResult('Select a TeamSpeak channel after connecting.');
+    return;
+  }
+  await saveConfig({ refresh: false, showResult: false });
+  const r = await fetch('/api/teamspeak/channel', { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({channel_id: id}) });
+  showResult(await r.json());
+  await loadConfig(); await loadStatus();
+}
 
 function connectEvents() {
   const pre = document.getElementById('events');

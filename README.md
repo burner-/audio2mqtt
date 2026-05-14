@@ -12,6 +12,9 @@ Version: 1.5.0
 Audio device
   -> FFmpeg
   -> TCP raw PCM 16 kHz mono s16le
+TeamSpeak server
+  -> audio2mqtt TeamSpeak bot client
+  -> per-speaker received audio
   -> Docker container: audio2mqtt
   -> Rust service
   -> Silero VAD V5
@@ -92,6 +95,8 @@ You can configure:
 - frame-level VAD debug on/off
 - MQTT enabled/disabled
 - MQTT host, port, topic, username, password and QoS
+- TeamSpeak receiver enabled/disabled
+- TeamSpeak server, nickname, identity and channel selection
 - webhook endpoints
 
 Settings are stored in:
@@ -177,6 +182,43 @@ pcm_s16le: 16 kHz mono signed 16-bit little-endian PCM.
 ```
 
 REST responses use the same transcript schema as stream events.
+
+## TeamSpeak input
+
+The TeamSpeak receiver connects as a normal client to an external TeamSpeak server. It does not implement or run a TeamSpeak server.
+
+The Docker image includes Opus runtime libraries for TeamSpeak audio decoding.
+
+In the web admin:
+
+- set the TeamSpeak server address, nickname and optional passwords
+- keep the generated identity or paste another identity into the identity field
+- connect once to fetch the channel list
+- select a channel from the dropdown and save it
+
+The selected channel is stored in `./config/config.json` by id and path. On restart the service first tries the saved channel id, then the saved path, and finally falls back to the server default channel so the bot can still connect and refresh the channel list. If the selected channel no longer exists, the TeamSpeak status is shown as `channel_missing`.
+
+TeamSpeak transcript events use the same MQTT topic, webhooks and JSONL output as other inputs. The source identifies the origin:
+
+```json
+{
+  "source": {
+    "type": "teamspeak",
+    "src": "ts.example.com:9987",
+    "meta": {
+      "transport": "teamspeak",
+      "client_id": 42,
+      "client_name": "Speaker",
+      "channel_id": 7,
+      "channel_name": "Default",
+      "channel_path": "Default",
+      "sample_rate_original": 48000,
+      "sample_rate": 16000,
+      "channels": 1
+    }
+  }
+}
+```
 
 ## MQTT
 

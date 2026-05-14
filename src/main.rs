@@ -17,7 +17,7 @@ use rumqttc::{AsyncClient, EventLoop, MqttOptions, QoS};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::{
-    collections::VecDeque,
+    collections::{HashMap, VecDeque},
     convert::Infallible,
     fs,
     io::{Cursor, Read},
@@ -32,11 +32,14 @@ use tokio::{
     io::AsyncWriteExt,
     net::TcpListener,
     sync::{broadcast, mpsc, oneshot},
+    time,
 };
 use tokio_stream::wrappers::BroadcastStream;
 use tower_http::{services::ServeDir, trace::TraceLayer};
 use tracing::{debug, error, info, warn};
 use tracing_subscriber::{layer::SubscriberExt, reload, util::SubscriberInitExt, EnvFilter};
+use tsclientlib::{ChannelId, ClientId, Connection as TsConnection, Identity, StreamItem};
+use tsproto_packets::packets::AudioData;
 use uuid::Uuid;
 use voice_activity_detector::VoiceActivityDetector;
 use whisper_rs::{FullParams, SamplingStrategy, WhisperContext, WhisperContextParameters};
@@ -44,6 +47,8 @@ use whisper_rs::{FullParams, SamplingStrategy, WhisperContext, WhisperContextPar
 const SAMPLE_RATE: usize = 16_000;
 const BYTES_PER_SAMPLE: usize = 2;
 const VAD_FRAME_SAMPLES: usize = 512;
+const TEAMSPEAK_SAMPLE_RATE: usize = 48_000;
+const TEAMSPEAK_FRAME_SAMPLES: usize = 960;
 
 #[derive(Debug, Clone)]
 struct EnvConfig {
@@ -115,6 +120,8 @@ struct RuntimeConfig {
     logging: LoggingConfig,
     #[serde(default)]
     transcription: TranscriptionConfig,
+    #[serde(default)]
+    teamspeak: TeamSpeakConfig,
 }
 
 impl Default for RuntimeConfig {
@@ -125,6 +132,7 @@ impl Default for RuntimeConfig {
             models: ModelConfig::default(),
             logging: LoggingConfig::default(),
             transcription: TranscriptionConfig::default(),
+            teamspeak: TeamSpeakConfig::default(),
         }
     }
 }
@@ -140,8 +148,114 @@ impl RuntimeConfig {
             },
             logging: LoggingConfig::default(),
             transcription: TranscriptionConfig::from_env(env),
+            teamspeak: TeamSpeakConfig::default(),
         }
     }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct TeamSpeakConfig {
+    #[serde(default)]
+    enabled: bool,
+    #[serde(default = "default_teamspeak_server_address")]
+    server_address: String,
+    #[serde(default)]
+    server_password: Option<String>,
+    #[serde(default = "default_teamspeak_nickname")]
+    nickname: String,
+    #[serde(default)]
+    identity: String,
+    #[serde(default)]
+    channel_id: Option<u64>,
+    #[serde(default)]
+    channel_path: String,
+    #[serde(default)]
+    channel_password: Option<String>,
+    #[serde(default = "default_teamspeak_reconnect_seconds")]
+    reconnect_seconds: u64,
+}
+
+fn default_teamspeak_server_address() -> String {
+    "localhost:9987".to_string()
+}
+
+fn default_teamspeak_nickname() -> String {
+    "audio2mqtt".to_string()
+}
+
+fn default_teamspeak_reconnect_seconds() -> u64 {
+    10
+}
+
+impl Default for TeamSpeakConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            server_address: default_teamspeak_server_address(),
+            server_password: None,
+            nickname: default_teamspeak_nickname(),
+            identity: String::new(),
+            channel_id: None,
+            channel_path: String::new(),
+            channel_password: None,
+            reconnect_seconds: default_teamspeak_reconnect_seconds(),
+        }
+    }
+}
+
+impl TeamSpeakConfig {
+    fn normalized(&self) -> Self {
+        let mut cfg = self.clone();
+        if cfg.server_address.trim().is_empty() {
+            cfg.server_address = default_teamspeak_server_address();
+        } else {
+            cfg.server_address = cfg.server_address.trim().to_string();
+        }
+        if cfg.nickname.trim().is_empty() {
+            cfg.nickname = default_teamspeak_nickname();
+        } else {
+            cfg.nickname = cfg.nickname.trim().to_string();
+        }
+        cfg.identity = cfg.identity.trim().to_string();
+        if cfg.identity.is_empty() {
+            cfg.identity = create_teamspeak_identity_string();
+        }
+        cfg.channel_path = cfg.channel_path.trim().trim_matches('/').to_string();
+        cfg.server_password = normalize_optional_secret(cfg.server_password.as_deref());
+        cfg.channel_password = normalize_optional_secret(cfg.channel_password.as_deref());
+        cfg.reconnect_seconds = cfg.reconnect_seconds.clamp(1, 300);
+        cfg
+    }
+}
+
+fn normalize_optional_secret(value: Option<&str>) -> Option<String> {
+    value
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(ToOwned::to_owned)
+}
+
+fn create_teamspeak_identity_string() -> String {
+    identity_to_config_string(&Identity::create()).unwrap_or_default()
+}
+
+fn identity_to_config_string(identity: &Identity) -> Result<String> {
+    let value = serde_json::to_value(identity)?;
+    Ok(match value {
+        Value::String(s) => s,
+        other => other.to_string(),
+    })
+}
+
+fn parse_teamspeak_identity(value: &str) -> Result<Identity> {
+    let trimmed = value.trim();
+    if let Ok(identity) = Identity::new_from_str(trimmed) {
+        return Ok(identity);
+    }
+    if let Ok(identity) = Identity::new_from_ts_str(trimmed) {
+        return Ok(identity);
+    }
+    serde_json::from_str::<Identity>(trimmed).with_context(|| "parsing TeamSpeak identity")
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -403,6 +517,72 @@ struct SharedState {
     env: EnvConfig,
     log_reload: Arc<reload::Handle<EnvFilter, tracing_subscriber::Registry>>,
     job_tx: mpsc::Sender<TranscribeJob>,
+    teamspeak: TeamSpeakControl,
+}
+
+#[derive(Clone)]
+struct TeamSpeakControl {
+    tx: mpsc::UnboundedSender<TeamSpeakCommand>,
+    status: Arc<RwLock<TeamSpeakStatus>>,
+}
+
+#[derive(Debug)]
+enum TeamSpeakCommand {
+    Connect,
+    Disconnect,
+    Reconnect,
+    Apply(TeamSpeakConfig),
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct TeamSpeakStatus {
+    state: String,
+    enabled: bool,
+    connected: bool,
+    server_address: String,
+    active_channel_id: Option<u64>,
+    active_channel_path: String,
+    last_error: Option<String>,
+    connected_at: Option<DateTime<Utc>>,
+    channels: Vec<TeamSpeakChannelInfo>,
+}
+
+impl Default for TeamSpeakStatus {
+    fn default() -> Self {
+        Self {
+            state: "disabled".to_string(),
+            enabled: false,
+            connected: false,
+            server_address: default_teamspeak_server_address(),
+            active_channel_id: None,
+            active_channel_path: String::new(),
+            last_error: None,
+            connected_at: None,
+            channels: vec![],
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct TeamSpeakChannelInfo {
+    id: u64,
+    parent_id: Option<u64>,
+    name: String,
+    path: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct TeamSpeakChannelSelectRequest {
+    channel_id: u64,
+}
+
+#[derive(Debug, Clone)]
+struct TeamSpeakSpeakerMeta {
+    client_id: u64,
+    client_name: String,
+    channel_id: Option<u64>,
+    channel_name: String,
+    channel_path: String,
 }
 
 struct TranscribeJob {
@@ -506,6 +686,12 @@ async fn main() -> Result<()> {
     let (events_tx, _) = broadcast::channel::<String>(128);
     let (job_tx, job_rx) = mpsc::channel::<TranscribeJob>(8);
     let (transcript_tx, transcript_rx) = mpsc::unbounded_channel::<TranscriptEvent>();
+    let (teamspeak_tx, teamspeak_rx) = mpsc::unbounded_channel::<TeamSpeakCommand>();
+    let teamspeak_status = Arc::new(RwLock::new(TeamSpeakStatus::default()));
+    let teamspeak_control = TeamSpeakControl {
+        tx: teamspeak_tx.clone(),
+        status: teamspeak_status.clone(),
+    };
 
     let shared = SharedState {
         runtime_config: Arc::new(RwLock::new(runtime_config)),
@@ -518,9 +704,17 @@ async fn main() -> Result<()> {
         env: env.clone(),
         log_reload: Arc::new(log_reload),
         job_tx: job_tx.clone(),
+        teamspeak: teamspeak_control,
     };
 
     start_transcriber_thread(env.clone(), shared.runtime_config.clone(), job_rx, transcript_tx)?;
+
+    tokio::spawn(run_teamspeak_manager(
+        shared.runtime_config.clone(),
+        job_tx.clone(),
+        teamspeak_status,
+        teamspeak_rx,
+    ));
 
     let dispatcher_state = shared.clone();
     tokio::spawn(async move {
@@ -550,6 +744,7 @@ fn load_or_create_runtime_config(path: &str, env: &EnvConfig) -> Result<RuntimeC
         let raw_value: Value = serde_json::from_str(&raw).with_context(|| format!("parsing {path}"))?;
         let has_models = raw_value.get("models").is_some();
         let has_transcription = raw_value.get("transcription").is_some();
+        let has_teamspeak = raw_value.get("teamspeak").is_some();
         let mut parsed: RuntimeConfig = serde_json::from_value(raw_value).with_context(|| format!("parsing {path}"))?;
         if !has_models {
             parsed.models = ModelConfig {
@@ -560,6 +755,10 @@ fn load_or_create_runtime_config(path: &str, env: &EnvConfig) -> Result<RuntimeC
         }
         if !has_transcription {
             parsed.transcription = TranscriptionConfig::from_env(env);
+            changed = true;
+        }
+        if !has_teamspeak {
+            parsed.teamspeak = TeamSpeakConfig::default();
             changed = true;
         }
         parsed
@@ -576,6 +775,11 @@ fn load_or_create_runtime_config(path: &str, env: &EnvConfig) -> Result<RuntimeC
         changed = true;
     }
     cfg.transcription = cfg.transcription.normalized();
+    let normalized_teamspeak = cfg.teamspeak.normalized();
+    if serde_json::to_value(&cfg.teamspeak)? != serde_json::to_value(&normalized_teamspeak)? {
+        cfg.teamspeak = normalized_teamspeak;
+        changed = true;
+    }
     changed |= ensure_finnish_nlp_profile(&mut cfg.models.profiles);
 
     if cfg.models.active_model_id.trim().is_empty()
@@ -881,12 +1085,6 @@ fn handle_audio_connection_blocking(
     runtime_config: Arc<RwLock<RuntimeConfig>>,
     job_tx: mpsc::Sender<TranscribeJob>,
 ) -> Result<()> {
-    let mut vad = VoiceActivityDetector::builder()
-        .sample_rate(SAMPLE_RATE as u32)
-        .chunk_size(VAD_FRAME_SAMPLES)
-        .build()
-        .context("creating Silero VAD V5 detector")?;
-
     let peer_src = stream
         .peer_addr()
         .map(|p| p.to_string())
@@ -902,16 +1100,10 @@ fn handle_audio_connection_blocking(
         }),
     };
     let context: Option<Value> = None;
+    let mut segmenter = AudioSegmenter::new(source, context)?;
 
     let mut byte_buf = vec![0u8; 8192];
     let mut pending_samples: Vec<i16> = Vec::new();
-
-    let mut pre_roll: VecDeque<f32> = VecDeque::new();
-    let mut current_segment: Vec<f32> = Vec::new();
-    let mut current_start_sample: u64 = 0;
-    let mut total_samples_seen: u64 = 0;
-    let mut silence_samples_in_segment: usize = 0;
-    let mut in_speech = false;
 
     loop {
         let n = stream.read(&mut byte_buf)?;
@@ -927,105 +1119,618 @@ fn handle_audio_connection_blocking(
         while pending_samples.len() >= VAD_FRAME_SAMPLES {
             let frame_i16: Vec<i16> = pending_samples.drain(..VAD_FRAME_SAMPLES).collect();
             let frame_f32: Vec<f32> = frame_i16.iter().map(|s| (*s as f32) / 32768.0).collect();
-            let frame_start_sample = total_samples_seen;
-            total_samples_seen += VAD_FRAME_SAMPLES as u64;
-
-            let probability = vad.predict(frame_i16);
-            let (transcription, vad_debug) = current_transcription_settings(&runtime_config);
-            let vad_threshold = transcription.vad_threshold;
-            let pre_roll_len = seconds_to_samples_allow_zero(transcription.pre_roll_seconds);
-            let max_segment_samples = seconds_to_samples(transcription.max_segment_seconds);
-            let min_segment_samples = seconds_to_samples(transcription.min_segment_seconds);
-            let silence_cut_samples = seconds_to_samples(transcription.silence_cut_seconds);
-            let vad_info = VadInfo {
-                enabled: true,
-                engine: "silero".to_string(),
-                threshold: Some(vad_threshold),
-            };
-            let is_voice = probability >= vad_threshold;
-            if vad_debug {
-                debug!(probability = probability, threshold = vad_threshold, is_voice = is_voice, "vad frame");
-            }
-
-            if !in_speech {
-                if pre_roll_len == 0 {
-                    pre_roll.clear();
-                } else {
-                    for &sample in &frame_f32 {
-                        while pre_roll.len() >= pre_roll_len {
-                            pre_roll.pop_front();
-                        }
-                        pre_roll.push_back(sample);
-                    }
-                }
-
-                if is_voice {
-                    in_speech = true;
-                    silence_samples_in_segment = 0;
-                    current_segment.clear();
-                    let pre_len = pre_roll.len();
-                    current_start_sample = frame_start_sample.saturating_sub(pre_len as u64);
-                    current_segment.extend(pre_roll.iter().copied());
-                    current_segment.extend_from_slice(&frame_f32);
-                    debug!(start_sample = current_start_sample, probability = probability, "speech started");
-                }
-                continue;
-            }
-
-            current_segment.extend_from_slice(&frame_f32);
-            if is_voice {
-                silence_samples_in_segment = 0;
-            } else {
-                silence_samples_in_segment += VAD_FRAME_SAMPLES;
-            }
-
-            let should_flush_for_max = current_segment.len() >= max_segment_samples;
-            let should_flush_for_silence = current_segment.len() >= min_segment_samples
-                && silence_samples_in_segment >= silence_cut_samples;
-
-            if should_flush_for_max || should_flush_for_silence {
-                let end_sample = total_samples_seen;
-                flush_segment_if_valid_blocking(
-                    &job_tx,
-                    &mut current_segment,
-                    current_start_sample,
-                    end_sample,
-                    min_segment_samples,
-                    &source,
-                    &context,
-                    &vad_info,
-                    None,
-                )?;
-                in_speech = false;
-                silence_samples_in_segment = 0;
-                pre_roll.clear();
-                debug!(end_sample = end_sample, max = should_flush_for_max, silence = should_flush_for_silence, "speech ended");
-            }
+            segmenter.push_frame_blocking(frame_f32, frame_i16, &runtime_config, &job_tx)?;
         }
     }
 
-    if in_speech && !current_segment.is_empty() {
-        let (transcription, _) = current_transcription_settings(&runtime_config);
+    segmenter.finish_blocking(&runtime_config, &job_tx)?;
+
+    Ok(())
+}
+
+struct AudioSegmenter {
+    vad: VoiceActivityDetector,
+    source: SourceInfo,
+    context: Option<Value>,
+    pending_samples: Vec<f32>,
+    pre_roll: VecDeque<f32>,
+    current_segment: Vec<f32>,
+    current_start_sample: u64,
+    total_samples_seen: u64,
+    silence_samples_in_segment: usize,
+    in_speech: bool,
+}
+
+impl AudioSegmenter {
+    fn new(source: SourceInfo, context: Option<Value>) -> Result<Self> {
+        Ok(Self {
+            vad: VoiceActivityDetector::builder()
+                .sample_rate(SAMPLE_RATE as u32)
+                .chunk_size(VAD_FRAME_SAMPLES)
+                .build()
+                .context("creating Silero VAD V5 detector")?,
+            source,
+            context,
+            pending_samples: Vec::new(),
+            pre_roll: VecDeque::new(),
+            current_segment: Vec::new(),
+            current_start_sample: 0,
+            total_samples_seen: 0,
+            silence_samples_in_segment: 0,
+            in_speech: false,
+        })
+    }
+
+    fn set_source(&mut self, source: SourceInfo) {
+        self.source = source;
+    }
+
+    fn push_samples_blocking(
+        &mut self,
+        samples: &[f32],
+        runtime_config: &Arc<RwLock<RuntimeConfig>>,
+        job_tx: &mpsc::Sender<TranscribeJob>,
+    ) -> Result<()> {
+        self.pending_samples.extend_from_slice(samples);
+        while self.pending_samples.len() >= VAD_FRAME_SAMPLES {
+            let frame_f32: Vec<f32> = self.pending_samples.drain(..VAD_FRAME_SAMPLES).collect();
+            let frame_i16 = frame_f32_to_i16(&frame_f32);
+            self.push_frame_blocking(frame_f32, frame_i16, runtime_config, job_tx)?;
+        }
+        Ok(())
+    }
+
+    fn push_frame_blocking(
+        &mut self,
+        frame_f32: Vec<f32>,
+        frame_i16: Vec<i16>,
+        runtime_config: &Arc<RwLock<RuntimeConfig>>,
+        job_tx: &mpsc::Sender<TranscribeJob>,
+    ) -> Result<()> {
+        let frame_start_sample = self.total_samples_seen;
+        self.total_samples_seen += VAD_FRAME_SAMPLES as u64;
+
+        let probability = self.vad.predict(frame_i16);
+        let (transcription, vad_debug) = current_transcription_settings(runtime_config);
+        let vad_threshold = transcription.vad_threshold;
+        let pre_roll_len = seconds_to_samples_allow_zero(transcription.pre_roll_seconds);
+        let max_segment_samples = seconds_to_samples(transcription.max_segment_seconds);
         let min_segment_samples = seconds_to_samples(transcription.min_segment_seconds);
+        let silence_cut_samples = seconds_to_samples(transcription.silence_cut_seconds);
         let vad_info = VadInfo {
             enabled: true,
             engine: "silero".to_string(),
-            threshold: Some(transcription.vad_threshold),
+            threshold: Some(vad_threshold),
         };
-        flush_segment_if_valid_blocking(
-            &job_tx,
-            &mut current_segment,
-            current_start_sample,
-            total_samples_seen,
-            min_segment_samples,
-            &source,
-            &context,
-            &vad_info,
-            None,
-        )?;
+        let is_voice = probability >= vad_threshold;
+        if vad_debug {
+            debug!(probability = probability, threshold = vad_threshold, is_voice = is_voice, "vad frame");
+        }
+
+        if !self.in_speech {
+            if pre_roll_len == 0 {
+                self.pre_roll.clear();
+            } else {
+                for &sample in &frame_f32 {
+                    while self.pre_roll.len() >= pre_roll_len {
+                        self.pre_roll.pop_front();
+                    }
+                    self.pre_roll.push_back(sample);
+                }
+            }
+
+            if is_voice {
+                self.in_speech = true;
+                self.silence_samples_in_segment = 0;
+                self.current_segment.clear();
+                let pre_len = self.pre_roll.len();
+                self.current_start_sample = frame_start_sample.saturating_sub(pre_len as u64);
+                self.current_segment.extend(self.pre_roll.iter().copied());
+                self.current_segment.extend_from_slice(&frame_f32);
+                debug!(start_sample = self.current_start_sample, probability = probability, "speech started");
+            }
+            return Ok(());
+        }
+
+        self.current_segment.extend_from_slice(&frame_f32);
+        if is_voice {
+            self.silence_samples_in_segment = 0;
+        } else {
+            self.silence_samples_in_segment += VAD_FRAME_SAMPLES;
+        }
+
+        let should_flush_for_max = self.current_segment.len() >= max_segment_samples;
+        let should_flush_for_silence = self.current_segment.len() >= min_segment_samples
+            && self.silence_samples_in_segment >= silence_cut_samples;
+
+        if should_flush_for_max || should_flush_for_silence {
+            let end_sample = self.total_samples_seen;
+            flush_segment_if_valid_blocking(
+                job_tx,
+                &mut self.current_segment,
+                self.current_start_sample,
+                end_sample,
+                min_segment_samples,
+                &self.source,
+                &self.context,
+                &vad_info,
+                None,
+            )?;
+            self.in_speech = false;
+            self.silence_samples_in_segment = 0;
+            self.pre_roll.clear();
+            debug!(end_sample = end_sample, max = should_flush_for_max, silence = should_flush_for_silence, "speech ended");
+        }
+
+        Ok(())
     }
 
-    Ok(())
+    fn finish_blocking(
+        &mut self,
+        runtime_config: &Arc<RwLock<RuntimeConfig>>,
+        job_tx: &mpsc::Sender<TranscribeJob>,
+    ) -> Result<()> {
+        if self.in_speech && !self.current_segment.is_empty() {
+            let (transcription, _) = current_transcription_settings(runtime_config);
+            let min_segment_samples = seconds_to_samples(transcription.min_segment_seconds);
+            let vad_info = VadInfo {
+                enabled: true,
+                engine: "silero".to_string(),
+                threshold: Some(transcription.vad_threshold),
+            };
+            flush_segment_if_valid_blocking(
+                job_tx,
+                &mut self.current_segment,
+                self.current_start_sample,
+                self.total_samples_seen,
+                min_segment_samples,
+                &self.source,
+                &self.context,
+                &vad_info,
+                None,
+            )?;
+        }
+        self.in_speech = false;
+        self.pending_samples.clear();
+        self.pre_roll.clear();
+        self.current_segment.clear();
+        self.silence_samples_in_segment = 0;
+        Ok(())
+    }
+}
+
+fn frame_f32_to_i16(frame: &[f32]) -> Vec<i16> {
+    frame
+        .iter()
+        .map(|sample| (sample.clamp(-1.0, 1.0) * 32767.0).round() as i16)
+        .collect()
+}
+
+async fn run_teamspeak_manager(
+    runtime_config: Arc<RwLock<RuntimeConfig>>,
+    job_tx: mpsc::Sender<TranscribeJob>,
+    status: Arc<RwLock<TeamSpeakStatus>>,
+    mut command_rx: mpsc::UnboundedReceiver<TeamSpeakCommand>,
+) {
+    let mut cfg = runtime_config.read().unwrap().teamspeak.clone().normalized();
+    update_teamspeak_status(&status, |s| {
+        s.enabled = cfg.enabled;
+        s.server_address = cfg.server_address.clone();
+        s.state = if cfg.enabled { "disconnected" } else { "disabled" }.to_string();
+    });
+
+    loop {
+        if !cfg.enabled {
+            match command_rx.recv().await {
+                Some(TeamSpeakCommand::Apply(new_cfg)) => cfg = new_cfg.normalized(),
+                Some(TeamSpeakCommand::Connect) | Some(TeamSpeakCommand::Reconnect) => {
+                    cfg = runtime_config.read().unwrap().teamspeak.clone().normalized();
+                    cfg.enabled = true;
+                }
+                Some(TeamSpeakCommand::Disconnect) => {}
+                None => break,
+            }
+            update_teamspeak_status(&status, |s| {
+                s.enabled = cfg.enabled;
+                s.server_address = cfg.server_address.clone();
+                if !cfg.enabled {
+                    s.state = "disabled".to_string();
+                    s.connected = false;
+                    s.connected_at = None;
+                }
+            });
+            continue;
+        }
+
+        match run_teamspeak_session(cfg.clone(), runtime_config.clone(), job_tx.clone(), status.clone(), &mut command_rx).await {
+            TeamSpeakSessionEnd::Apply(new_cfg) => cfg = new_cfg.normalized(),
+            TeamSpeakSessionEnd::Disconnected => {
+                cfg = runtime_config.read().unwrap().teamspeak.clone().normalized();
+                update_teamspeak_status(&status, |s| {
+                    s.state = if cfg.enabled { "disconnected" } else { "disabled" }.to_string();
+                    s.enabled = cfg.enabled;
+                    s.connected = false;
+                    s.connected_at = None;
+                });
+            }
+            TeamSpeakSessionEnd::Reconnect => {
+                cfg = runtime_config.read().unwrap().teamspeak.clone().normalized();
+                update_teamspeak_status(&status, |s| {
+                    s.state = "reconnecting".to_string();
+                    s.enabled = cfg.enabled;
+                    s.connected = false;
+                    s.connected_at = None;
+                });
+                time::sleep(Duration::from_secs(cfg.reconnect_seconds)).await;
+            }
+            TeamSpeakSessionEnd::Fatal(err) => {
+                let reconnect_seconds = cfg.reconnect_seconds;
+                update_teamspeak_status(&status, |s| {
+                    s.state = "error".to_string();
+                    s.enabled = cfg.enabled;
+                    s.connected = false;
+                    s.connected_at = None;
+                    s.last_error = Some(err);
+                });
+                time::sleep(Duration::from_secs(reconnect_seconds)).await;
+                cfg = runtime_config.read().unwrap().teamspeak.clone().normalized();
+            }
+        }
+    }
+}
+
+enum TeamSpeakSessionEnd {
+    Apply(TeamSpeakConfig),
+    Disconnected,
+    Reconnect,
+    Fatal(String),
+}
+
+async fn run_teamspeak_session(
+    cfg: TeamSpeakConfig,
+    runtime_config: Arc<RwLock<RuntimeConfig>>,
+    job_tx: mpsc::Sender<TranscribeJob>,
+    status: Arc<RwLock<TeamSpeakStatus>>,
+    command_rx: &mut mpsc::UnboundedReceiver<TeamSpeakCommand>,
+) -> TeamSpeakSessionEnd {
+    update_teamspeak_status(&status, |s| {
+        s.state = "connecting".to_string();
+        s.enabled = true;
+        s.connected = false;
+        s.server_address = cfg.server_address.clone();
+        s.last_error = None;
+    });
+
+    let mut con = match connect_teamspeak(&cfg) {
+        Ok(con) => con,
+        Err(e) => {
+            return TeamSpeakSessionEnd::Fatal(e.to_string());
+        }
+    };
+
+    let logger = slog::Logger::root(slog::Discard, slog::o!());
+    let mut audio_handler = tsclientlib::audio::AudioHandler::<ClientId>::new(logger);
+    let mut segmenters: HashMap<ClientId, AudioSegmenter> = HashMap::new();
+    let mut speakers: HashMap<ClientId, TeamSpeakSpeakerMeta> = HashMap::new();
+    let mut channels_by_id: HashMap<u64, TeamSpeakChannelInfo> = HashMap::new();
+    let mut audio_tick = time::interval(Duration::from_millis(20));
+
+    loop {
+        tokio::select! {
+            command = command_rx.recv() => {
+                match command {
+                    Some(TeamSpeakCommand::Apply(new_cfg)) => {
+                        return TeamSpeakSessionEnd::Apply(new_cfg);
+                    }
+                    Some(TeamSpeakCommand::Disconnect) => {
+                        return TeamSpeakSessionEnd::Disconnected;
+                    }
+                    Some(TeamSpeakCommand::Connect) | Some(TeamSpeakCommand::Reconnect) => {
+                        return TeamSpeakSessionEnd::Reconnect;
+                    }
+                    None => {
+                        return TeamSpeakSessionEnd::Disconnected;
+                    }
+                }
+            }
+            _ = audio_tick.tick() => {
+                let mut output = vec![0.0f32; TEAMSPEAK_FRAME_SAMPLES];
+                let ended = audio_handler.fill_buffer_with_proc(&mut output, |client_id, samples| {
+                    let source = teamspeak_source_for_client(&cfg, client_id, &speakers);
+                    let mono_16k = downsample_teamspeak_to_asr(samples);
+                    if !segmenters.contains_key(client_id) {
+                        match AudioSegmenter::new(source.clone(), None) {
+                            Ok(segmenter) => {
+                                segmenters.insert(*client_id, segmenter);
+                            }
+                            Err(e) => {
+                                warn!(client_id = ?client_id, error = %e, "failed to create TeamSpeak audio segmenter");
+                                return;
+                            }
+                        }
+                    }
+                    if let Some(entry) = segmenters.get_mut(client_id) {
+                        entry.set_source(source);
+                        if let Err(e) = entry.push_samples_blocking(&mono_16k, &runtime_config, &job_tx) {
+                            warn!(client_id = ?client_id, error = %e, "failed to segment TeamSpeak audio");
+                        }
+                    }
+                });
+                for client_id in ended {
+                    if let Some(mut segmenter) = segmenters.remove(&client_id) {
+                        if let Err(e) = segmenter.finish_blocking(&runtime_config, &job_tx) {
+                            warn!(client_id = ?client_id, error = %e, "failed to flush TeamSpeak audio segment");
+                        }
+                    }
+                }
+            }
+            event = con.events().next() => {
+                let Some(event) = event else {
+                    return TeamSpeakSessionEnd::Reconnect;
+                };
+                match event {
+                    Ok(StreamItem::BookEvents(_)) => {
+                        if let Ok(state) = con.get_state() {
+                            let channels = collect_teamspeak_channels(state);
+                            channels_by_id = channels.iter().map(|c| (c.id, c.clone())).collect();
+                            speakers = state.clients.iter()
+                                .map(|(id, client)| (*id, teamspeak_speaker_meta(client, &channels_by_id)))
+                                .collect();
+                            let own_channel = state.clients.get(&state.own_client).and_then(|c| channels_by_id.get(&channel_id_u64(c.channel)));
+                            let configured_path_exists = !cfg.channel_path.trim().is_empty()
+                                && channels.iter().any(|channel| channel.path == cfg.channel_path);
+                            let configured_id_exists = cfg.channel_id
+                                .map(|id| channels_by_id.contains_key(&id))
+                                .unwrap_or(false);
+                            let selected_missing = (cfg.channel_id.is_some() || !cfg.channel_path.trim().is_empty())
+                                && !configured_id_exists
+                                && !configured_path_exists;
+                            update_teamspeak_status(&status, |s| {
+                                s.state = if selected_missing { "channel_missing" } else { "connected" }.to_string();
+                                s.enabled = true;
+                                s.connected = true;
+                                s.server_address = cfg.server_address.clone();
+                                s.connected_at.get_or_insert_with(Utc::now);
+                                s.channels = channels.clone();
+                                s.active_channel_id = own_channel.map(|c| c.id);
+                                s.active_channel_path = own_channel.map(|c| c.path.clone()).unwrap_or_default();
+                                if selected_missing {
+                                    s.last_error = Some(format!("configured TeamSpeak channel is missing: {}", cfg.channel_path));
+                                } else {
+                                    s.last_error = None;
+                                }
+                            });
+                        }
+                    }
+                    Ok(StreamItem::Audio(packet)) => {
+                        if let Some(from) = teamspeak_audio_sender(&packet) {
+                            if let Err(e) = audio_handler.handle_packet(from, packet) {
+                                warn!(client_id = ?from, error = %e, "failed to handle TeamSpeak audio packet");
+                            }
+                        }
+                    }
+                    Ok(StreamItem::DisconnectedTemporarily(reason)) => {
+                        update_teamspeak_status(&status, |s| {
+                            s.state = "reconnecting".to_string();
+                            s.connected = false;
+                            s.connected_at = None;
+                            s.last_error = Some(format!("temporarily disconnected: {reason:?}"));
+                        });
+                    }
+                    Ok(_) => {}
+                    Err(e) => return TeamSpeakSessionEnd::Fatal(e.to_string()),
+                }
+            }
+        }
+    }
+}
+
+fn connect_teamspeak(cfg: &TeamSpeakConfig) -> Result<TsConnection> {
+    let primary = if let Some(channel_id) = cfg.channel_id {
+        Some(TeamSpeakConnectChannel::Id(channel_id))
+    } else if !cfg.channel_path.trim().is_empty() {
+        Some(TeamSpeakConnectChannel::Path(cfg.channel_path.clone()))
+    } else {
+        None
+    };
+    let options = build_teamspeak_connect_options(cfg, primary.clone())?;
+
+    match options.connect() {
+        Ok(con) => Ok(con),
+        Err(primary_error) if primary.is_some() => {
+            if cfg.channel_id.is_some() && !cfg.channel_path.trim().is_empty() {
+                warn!(error = %primary_error, "TeamSpeak channel id failed, retrying saved channel path");
+                let path_options = build_teamspeak_connect_options(cfg, Some(TeamSpeakConnectChannel::Path(cfg.channel_path.clone())))?;
+                if let Ok(con) = path_options.connect() {
+                    return Ok(con);
+                }
+            }
+            warn!(error = %primary_error, "TeamSpeak configured channel failed, retrying default channel");
+            build_teamspeak_connect_options(cfg, None)?
+                .connect()
+                .with_context(|| format!("TeamSpeak channel connect failed first: {primary_error}"))
+        }
+        Err(e) => Err(e.into()),
+    }
+}
+
+#[derive(Clone)]
+enum TeamSpeakConnectChannel {
+    Id(u64),
+    Path(String),
+}
+
+fn build_teamspeak_connect_options(
+    cfg: &TeamSpeakConfig,
+    channel: Option<TeamSpeakConnectChannel>,
+) -> Result<tsclientlib::ConnectOptions> {
+    let identity = parse_teamspeak_identity(&cfg.identity)?;
+    let mut options = TsConnection::build(cfg.server_address.clone())
+        .name(cfg.nickname.clone())
+        .identity(identity)
+        .input_muted(true)
+        .output_muted(false);
+    if let Some(password) = &cfg.server_password {
+        options = options.password(password.clone());
+    }
+    match channel {
+        Some(TeamSpeakConnectChannel::Id(channel_id)) => {
+            options = options.channel_id(ChannelId(channel_id));
+        }
+        Some(TeamSpeakConnectChannel::Path(path)) => {
+            options = options.channel(path);
+        }
+        None => {}
+    }
+    if let Some(channel_password) = &cfg.channel_password {
+        options = options.channel_password(channel_password.clone());
+    }
+    Ok(options)
+}
+
+fn teamspeak_audio_sender(packet: &tsproto_packets::packets::InAudioBuf) -> Option<ClientId> {
+    match packet.data().data() {
+        AudioData::S2C { from, .. } | AudioData::S2CWhisper { from, .. } => Some(ClientId(*from)),
+        _ => None,
+    }
+}
+
+fn teamspeak_source_for_client(
+    cfg: &TeamSpeakConfig,
+    client_id: &ClientId,
+    speakers: &HashMap<ClientId, TeamSpeakSpeakerMeta>,
+) -> SourceInfo {
+    let meta = speakers.get(client_id).cloned().unwrap_or_else(|| TeamSpeakSpeakerMeta {
+        client_id: client_id_u64(*client_id),
+        client_name: "unknown".to_string(),
+        channel_id: None,
+        channel_name: String::new(),
+        channel_path: String::new(),
+    });
+    SourceInfo {
+        source_type: "teamspeak".to_string(),
+        src: cfg.server_address.clone(),
+        meta: json!({
+            "transport": "teamspeak",
+            "client_id": meta.client_id,
+            "client_name": meta.client_name,
+            "channel_id": meta.channel_id,
+            "channel_name": meta.channel_name,
+            "channel_path": meta.channel_path,
+            "sample_rate_original": TEAMSPEAK_SAMPLE_RATE,
+            "sample_rate": SAMPLE_RATE,
+            "channels": 1
+        }),
+    }
+}
+
+fn downsample_teamspeak_to_asr(samples: &[f32]) -> Vec<f32> {
+    samples
+        .chunks(3)
+        .filter(|chunk| chunk.len() == 3)
+        .map(|chunk| (chunk[0] + chunk[1] + chunk[2]) / 3.0)
+        .collect()
+}
+
+fn update_teamspeak_status(status: &Arc<RwLock<TeamSpeakStatus>>, update: impl FnOnce(&mut TeamSpeakStatus)) {
+    let mut guard = status.write().unwrap();
+    update(&mut guard);
+}
+
+fn collect_teamspeak_channels(state: &tsclientlib::data::Connection) -> Vec<TeamSpeakChannelInfo> {
+    let mut channels = state
+        .channels
+        .iter()
+        .map(|(id, channel)| {
+            let id_u64 = channel_id_u64(*id);
+            let channel_value = serde_json::to_value(channel).unwrap_or(Value::Null);
+            let parent_id = teamspeak_channel_parent_from_value(&channel_value);
+            let name = teamspeak_channel_name_from_value(&channel_value).unwrap_or_else(|| format!("Channel {id_u64}"));
+            TeamSpeakChannelInfo {
+                id: id_u64,
+                parent_id,
+                name,
+                path: String::new(),
+            }
+        })
+        .collect::<Vec<_>>();
+
+    let names = channels
+        .iter()
+        .map(|c| (c.id, (c.parent_id, c.name.clone())))
+        .collect::<HashMap<_, _>>();
+    for channel in &mut channels {
+        channel.path = build_teamspeak_channel_path(channel.id, &names);
+    }
+    channels.sort_by(|a, b| a.path.cmp(&b.path).then_with(|| a.id.cmp(&b.id)));
+    channels
+}
+
+fn build_teamspeak_channel_path(id: u64, channels: &HashMap<u64, (Option<u64>, String)>) -> String {
+    let mut parts = Vec::new();
+    let mut current = Some(id);
+    let mut guard = 0;
+    while let Some(channel_id) = current {
+        guard += 1;
+        if guard > 64 {
+            break;
+        }
+        let Some((parent, name)) = channels.get(&channel_id) else {
+            break;
+        };
+        parts.push(name.clone());
+        current = *parent;
+    }
+    parts.reverse();
+    parts.join("/")
+}
+
+fn teamspeak_speaker_meta(
+    client: &tsclientlib::data::Client,
+    channels_by_id: &HashMap<u64, TeamSpeakChannelInfo>,
+) -> TeamSpeakSpeakerMeta {
+    let channel_id = channel_id_u64(client.channel);
+    let channel = channels_by_id.get(&channel_id);
+    TeamSpeakSpeakerMeta {
+        client_id: client_id_u64(client.id),
+        client_name: client.name.clone(),
+        channel_id: Some(channel_id),
+        channel_name: channel.map(|c| c.name.clone()).unwrap_or_default(),
+        channel_path: channel.map(|c| c.path.clone()).unwrap_or_default(),
+    }
+}
+
+fn teamspeak_channel_name_from_value(value: &Value) -> Option<String> {
+    value
+        .get("name")
+        .or_else(|| value.get("channel_name"))
+        .and_then(Value::as_str)
+        .map(ToOwned::to_owned)
+}
+
+fn teamspeak_channel_parent_from_value(value: &Value) -> Option<u64> {
+    let parent = value
+        .get("parent")
+        .or_else(|| value.get("parent_id"))
+        .or_else(|| value.get("pid"))
+        .or_else(|| value.get("channel_parent_id"));
+    match parent {
+        Some(Value::Number(n)) => n.as_u64().filter(|id| *id != 0),
+        Some(Value::Object(obj)) => obj
+            .get("0")
+            .or_else(|| obj.get("id"))
+            .and_then(Value::as_u64)
+            .filter(|id| *id != 0),
+        _ => None,
+    }
+}
+
+fn channel_id_u64(id: ChannelId) -> u64 {
+    id.0
+}
+
+fn client_id_u64(id: ClientId) -> u64 {
+    id.0 as u64
 }
 
 fn current_transcription_settings(runtime_config: &Arc<RwLock<RuntimeConfig>>) -> (TranscriptionConfig, bool) {
@@ -1188,6 +1893,11 @@ async fn run_web_admin(state: SharedState) -> Result<()> {
         .route("/api/models/download", post(download_model))
         .route("/api/models/activate", post(activate_model))
         .route("/api/models/huggingface", post(add_huggingface_model))
+        .route("/api/teamspeak/status", get(teamspeak_status))
+        .route("/api/teamspeak/connect", post(teamspeak_connect))
+        .route("/api/teamspeak/disconnect", post(teamspeak_disconnect))
+        .route("/api/teamspeak/reconnect", post(teamspeak_reconnect))
+        .route("/api/teamspeak/channel", post(teamspeak_select_channel))
         .route("/api/test/webhook", post(test_webhook))
         .route("/api/test/mqtt", post(test_mqtt))
         .route("/api/transcribe", post(rest_transcribe))
@@ -1228,6 +1938,7 @@ async fn status(State(state): State<SharedState>) -> impl IntoResponse {
         "transcription": transcription,
         "output_jsonl": state.env.output_jsonl.clone(),
         "logging": cfg.logging,
+        "teamspeak": state.teamspeak.status.read().unwrap().clone(),
     }))
 }
 
@@ -1242,6 +1953,7 @@ async fn post_config(State(state): State<SharedState>, Json(mut new_cfg): Json<R
         let mut guard = state.runtime_config.write().unwrap();
         *guard = new_cfg.clone();
     }
+    let _ = state.teamspeak.tx.send(TeamSpeakCommand::Apply(new_cfg.teamspeak.clone()));
     let reload_result = state
         .log_reload
         .reload(EnvFilter::new(log_filter_from_level(&new_cfg.logging.level)))
@@ -1253,8 +1965,76 @@ async fn post_config(State(state): State<SharedState>, Json(mut new_cfg): Json<R
     }
 }
 
+async fn teamspeak_status(State(state): State<SharedState>) -> impl IntoResponse {
+    Json(state.teamspeak.status.read().unwrap().clone())
+}
+
+async fn teamspeak_connect(State(state): State<SharedState>) -> impl IntoResponse {
+    let mut cfg = state.runtime_config.read().unwrap().clone();
+    cfg.teamspeak.enabled = true;
+    normalize_runtime_config(&mut cfg, &state.env);
+    {
+        let mut guard = state.runtime_config.write().unwrap();
+        *guard = cfg.clone();
+    }
+    let saved = save_runtime_config(&state.config_path, &cfg).map_err(|e| e.to_string());
+    let sent = state.teamspeak.tx.send(TeamSpeakCommand::Connect).is_ok();
+    Json(json!({"ok": saved.is_ok() && sent, "saved": saved.is_ok(), "command_sent": sent, "error": saved.err()}))
+}
+
+async fn teamspeak_disconnect(State(state): State<SharedState>) -> impl IntoResponse {
+    let mut cfg = state.runtime_config.read().unwrap().clone();
+    cfg.teamspeak.enabled = false;
+    normalize_runtime_config(&mut cfg, &state.env);
+    {
+        let mut guard = state.runtime_config.write().unwrap();
+        *guard = cfg.clone();
+    }
+    let saved = save_runtime_config(&state.config_path, &cfg).map_err(|e| e.to_string());
+    let sent = state.teamspeak.tx.send(TeamSpeakCommand::Disconnect).is_ok();
+    Json(json!({"ok": saved.is_ok() && sent, "saved": saved.is_ok(), "command_sent": sent, "error": saved.err()}))
+}
+
+async fn teamspeak_reconnect(State(state): State<SharedState>) -> impl IntoResponse {
+    let sent = state.teamspeak.tx.send(TeamSpeakCommand::Reconnect).is_ok();
+    Json(json!({"ok": sent, "command_sent": sent}))
+}
+
+async fn teamspeak_select_channel(
+    State(state): State<SharedState>,
+    Json(req): Json<TeamSpeakChannelSelectRequest>,
+) -> impl IntoResponse {
+    let channel = {
+        let status = state.teamspeak.status.read().unwrap();
+        status.channels.iter().find(|c| c.id == req.channel_id).cloned()
+    };
+
+    let Some(channel) = channel else {
+        return Json(json!({"ok": false, "error": format!("unknown TeamSpeak channel id {}", req.channel_id)}));
+    };
+
+    let mut cfg = state.runtime_config.read().unwrap().clone();
+    cfg.teamspeak.channel_id = Some(channel.id);
+    cfg.teamspeak.channel_path = channel.path.clone();
+    normalize_runtime_config(&mut cfg, &state.env);
+    {
+        let mut guard = state.runtime_config.write().unwrap();
+        *guard = cfg.clone();
+    }
+    let saved = save_runtime_config(&state.config_path, &cfg).map_err(|e| e.to_string());
+    let sent = state.teamspeak.tx.send(TeamSpeakCommand::Reconnect).is_ok();
+    Json(json!({
+        "ok": saved.is_ok() && sent,
+        "channel": channel,
+        "saved": saved.is_ok(),
+        "command_sent": sent,
+        "error": saved.err(),
+    }))
+}
+
 fn normalize_runtime_config(cfg: &mut RuntimeConfig, env: &EnvConfig) {
     cfg.transcription = cfg.transcription.normalized();
+    cfg.teamspeak = cfg.teamspeak.normalized();
     if cfg.models.profiles.is_empty() {
         cfg.models.profiles = default_model_profiles(&env.default_model_id, &env.model_path, &env.model_url);
     }
