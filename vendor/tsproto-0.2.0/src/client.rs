@@ -449,10 +449,22 @@ impl Client {
 			let mut beta = [0; 54];
 			beta.copy_from_slice(&beta_vec);
 
-			// Parse license argument
-			let licenses = Licenses::parse(&l).map_err(Error::ParseLicense)?;
-			// Ephemeral key of server
-			let server_ek = licenses.derive_public_key(root).map_err(Error::ParseLicense)?;
+			// Parse license argument. Some servers report no license with newer/unknown
+			// license blocks. In that case, keep the protocol moving by treating the
+			// server as unlicensed and using the root key directly.
+			let server_ek = match Licenses::parse(&l)
+				.and_then(|licenses| licenses.derive_public_key(root.clone()))
+			{
+				Ok(server_ek) => server_ek,
+				Err(e) => {
+					warn!(
+						self.con.logger,
+						"Failed to parse or derive TeamSpeak license, treating server as unlicensed";
+						"error" => %e
+					);
+					root.0.decompress().ok_or(Error::ParseLicense(crate::license::Error::InvalidRootKey))?
+				}
+			};
 
 			// Create own ephemeral key
 			let ek = EccKeyPrivEd25519::create();

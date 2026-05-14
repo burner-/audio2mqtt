@@ -102,6 +102,11 @@ pub enum InnerLicense {
 	// 4: Token, 5: LicenseSign, 6: MyTsIdSign (not existing in the license
 	// parameter)
 	Ephemeral, // 32
+	/// Unknown block type in newer/no-license server handshakes. Keep the
+	/// block in the key derivation chain instead of aborting the connection.
+	Unknown {
+		block_type: u8,
+	},
 }
 
 #[derive(Clone, Debug, Default)]
@@ -133,6 +138,7 @@ impl InnerLicense {
 			InnerLicense::Server { .. } => 2,
 			InnerLicense::Code { .. } => 3,
 			InnerLicense::Ephemeral { .. } => 32,
+			InnerLicense::Unknown { block_type } => block_type,
 		}
 	}
 }
@@ -312,9 +318,7 @@ impl License {
 				(InnerLicense::Server { issuer, license_type, data: license_data }, 6 + len)
 			}
 			32 => (InnerLicense::Ephemeral, 0),
-			i => {
-				return Err(Error::UnknownBlockType(i));
-			}
+			i => (InnerLicense::Unknown { block_type: i }, 0),
 		};
 
 		let all_len = MIN_LEN + extra_len;
@@ -371,6 +375,7 @@ impl License {
 				w.write_be(0u8).map_err(Error::Serialize)?;
 			}
 			InnerLicense::Ephemeral => {}
+			InnerLicense::Unknown { .. } => {}
 		}
 
 		Ok(())
