@@ -1802,8 +1802,9 @@ fn flush_segment_if_valid_blocking(
     let id = Uuid::new_v4();
     let duration = audio.len() as f64 / SAMPLE_RATE as f64;
     info!(%id, duration_sec = duration, "queueing segment for transcription");
-    job_tx
-        .blocking_send(TranscribeJob {
+    send_transcribe_job(
+        job_tx,
+        TranscribeJob {
             id,
             audio,
             start_sample,
@@ -1813,8 +1814,21 @@ fn flush_segment_if_valid_blocking(
             context: context.clone(),
             vad: vad.clone(),
             reply,
-        })
-        .map_err(|e| anyhow!("transcriber queue closed: {e}"))?;
+        },
+    )?;
+    Ok(())
+}
+
+fn send_transcribe_job(job_tx: &mpsc::Sender<TranscribeJob>, job: TranscribeJob) -> Result<()> {
+    if tokio::runtime::Handle::try_current().is_ok() {
+        job_tx
+            .try_send(job)
+            .map_err(|e| anyhow!("transcriber queue unavailable: {e}"))?;
+    } else {
+        job_tx
+            .blocking_send(job)
+            .map_err(|e| anyhow!("transcriber queue closed: {e}"))?;
+    }
     Ok(())
 }
 
