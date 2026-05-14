@@ -97,6 +97,9 @@ pub enum InnerLicense {
 	Code {
 		issuer: String,
 	}, // 3
+	Ts5Server {
+		properties: Vec<usize>,
+	}, // 8
 	// 4: Token, 5: LicenseSign, 6: MyTsIdSign (not existing in the license
 	// parameter)
 	Ephemeral, // 32
@@ -135,6 +138,7 @@ impl InnerLicense {
 			InnerLicense::Website { .. } => 1,
 			InnerLicense::Server { .. } => 2,
 			InnerLicense::Code { .. } => 3,
+			InnerLicense::Ts5Server { .. } => 8,
 			InnerLicense::Ephemeral { .. } => 32,
 			InnerLicense::Unknown { block_type } => block_type,
 		}
@@ -342,7 +346,28 @@ impl License {
 				let (issuer, all_len) = parse_license_string_lossy(data, 47)?;
 				(InnerLicense::Server { issuer, license_type, data: license_data }, all_len - MIN_LEN)
 			}
-			8 => (InnerLicense::Unknown { block_type: 8 }, data.len() - MIN_LEN),
+			8 => {
+				if data.len() < MIN_LEN + 2 {
+					return Err(Error::TooShort);
+				}
+				let property_count = data[43];
+				let mut pos = 44;
+				let mut properties = Vec::new();
+				for _ in 0..property_count {
+					if pos >= data.len() {
+						return Err(Error::TooShort);
+					}
+					let property_offset = pos - 44;
+					let property_len = data[pos] as usize;
+					pos += 1;
+					if pos + property_len > data.len() {
+						return Err(Error::TooShort);
+					}
+					properties.push(property_offset);
+					pos += property_len;
+				}
+				(InnerLicense::Ts5Server { properties }, pos - MIN_LEN)
+			}
 			32 => (InnerLicense::Ephemeral, 0),
 			i => return Err(Error::UnknownBlockType(i)),
 		};
@@ -400,6 +425,7 @@ impl License {
 				w.write_all(issuer.as_bytes()).map_err(Error::Serialize)?;
 				w.write_be(0u8).map_err(Error::Serialize)?;
 			}
+			InnerLicense::Ts5Server { .. } => {}
 			InnerLicense::Ephemeral => {}
 			InnerLicense::Unknown { .. } => {}
 		}

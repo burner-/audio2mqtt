@@ -205,7 +205,7 @@ The patched `tsproto` also supports alternate license key derivation modes via:
 TSPROTO_LICENSE_DERIVE_MODE=ignore-unknown
 ```
 
-Available debug modes are `full`, `ignore-unknown`, `last-direct`, `unknown-direct` and `root-plus-unknown`. `unknown-direct` is used in `docker-compose.yml` while testing unlicensed/newer TeamSpeak server handshakes.
+Available debug modes are `full`, `ignore-unknown`, `last-direct`, `unknown-direct` and `root-plus-unknown`. `full` is used in `docker-compose.yml`; type 8 TS5 server license blocks are parsed explicitly before the final ephemeral block is applied.
 
 In the web admin:
 
