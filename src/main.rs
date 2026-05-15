@@ -55,6 +55,7 @@ const TEAMSPEAK_FRAME_BUFFER_SAMPLES: usize =
     TEAMSPEAK_FRAME_SAMPLES_PER_CHANNEL * TEAMSPEAK_DECODED_CHANNELS;
 const TEAMSPEAK_SEND_FRAME_SAMPLES: usize = TEAMSPEAK_SAMPLE_RATE / 50;
 const MAX_OPUS_FRAME_SIZE: usize = 1275;
+const MQTT_MAX_PACKET_SIZE_BYTES: usize = 64 * 1024 * 1024;
 const DEFAULT_MQTT_AUDIO_SEND_TOPIC: &str = "audio2mqtt/teamspeak/audio/send";
 
 #[derive(Debug, Clone)]
@@ -2210,6 +2211,7 @@ async fn publish_mqtt(_state: &SharedState, cfg: &MqttConfig, payload: String) -
 
     let mut options = MqttOptions::new(client_id, cfg.host.clone(), cfg.port);
     options.set_keep_alive(Duration::from_secs(10));
+    options.set_max_packet_size(MQTT_MAX_PACKET_SIZE_BYTES, MQTT_MAX_PACKET_SIZE_BYTES);
     if let Some(username) = &cfg.username {
         if !username.trim().is_empty() {
             options.set_credentials(username, cfg.password.clone().unwrap_or_default());
@@ -2293,6 +2295,7 @@ async fn run_mqtt_teamspeak_audio_subscription(
         listener_cfg.port,
     );
     options.set_keep_alive(Duration::from_secs(10));
+    options.set_max_packet_size(MQTT_MAX_PACKET_SIZE_BYTES, MQTT_MAX_PACKET_SIZE_BYTES);
     if let Some(username) = &listener_cfg.username {
         if !username.trim().is_empty() {
             options.set_credentials(username, listener_cfg.password.clone().unwrap_or_default());
