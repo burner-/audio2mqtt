@@ -13,7 +13,7 @@ use base64::{engine::general_purpose, Engine as _};
 use chrono::{DateTime, Utc};
 use futures_util::StreamExt;
 use reqwest::Client as HttpClient;
-use rumqttc::{AsyncClient, EventLoop, MqttOptions, QoS};
+use rumqttc::{AsyncClient, EventLoop, Event as MqttEvent, MqttOptions, Packet as MqttPacket, QoS};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::{
@@ -39,7 +39,7 @@ use tower_http::{services::ServeDir, trace::TraceLayer};
 use tracing::{debug, error, info, warn};
 use tracing_subscriber::{layer::SubscriberExt, reload, util::SubscriberInitExt, EnvFilter};
 use tsclientlib::{ChannelId, ClientId, Connection as TsConnection, Identity, StreamItem};
-use tsproto_packets::packets::AudioData;
+use tsproto_packets::packets::{AudioData, CodecType, OutAudio};
 use uuid::Uuid;
 use voice_activity_detector::VoiceActivityDetector;
 use whisper_rs::{FullParams, SamplingStrategy, WhisperContext, WhisperContextParameters};
@@ -53,6 +53,9 @@ const TEAMSPEAK_DOWNSAMPLE_RATIO: usize = TEAMSPEAK_SAMPLE_RATE / SAMPLE_RATE;
 const TEAMSPEAK_FRAME_SAMPLES_PER_CHANNEL: usize = TEAMSPEAK_SAMPLE_RATE / 50;
 const TEAMSPEAK_FRAME_BUFFER_SAMPLES: usize =
     TEAMSPEAK_FRAME_SAMPLES_PER_CHANNEL * TEAMSPEAK_DECODED_CHANNELS;
+const TEAMSPEAK_SEND_FRAME_SAMPLES: usize = TEAMSPEAK_SAMPLE_RATE / 50;
+const MAX_OPUS_FRAME_SIZE: usize = 1275;
+const DEFAULT_MQTT_AUDIO_SEND_TOPIC: &str = "audio2mqtt/teamspeak/audio/send";
 
 #[derive(Debug, Clone)]
 struct EnvConfig {
@@ -417,6 +420,8 @@ struct MqttConfig {
     password: Option<String>,
     client_id: String,
     topic: String,
+    #[serde(default = "default_mqtt_audio_send_topic")]
+    audio_send_topic: String,
     qos: u8,
 }
 
@@ -430,8 +435,43 @@ impl Default for MqttConfig {
             password: None,
             client_id: "audio2mqtt".to_string(),
             topic: "audio2mqtt/transcripts".to_string(),
+            audio_send_topic: default_mqtt_audio_send_topic(),
             qos: 1,
         }
+    }
+}
+
+fn default_mqtt_audio_send_topic() -> String {
+    DEFAULT_MQTT_AUDIO_SEND_TOPIC.to_string()
+}
+
+impl MqttConfig {
+    fn normalized(&self) -> Self {
+        let mut cfg = self.clone();
+        cfg.host = if cfg.host.trim().is_empty() {
+            "host.docker.internal".to_string()
+        } else {
+            cfg.host.trim().to_string()
+        };
+        cfg.client_id = if cfg.client_id.trim().is_empty() {
+            "audio2mqtt".to_string()
+        } else {
+            cfg.client_id.trim().to_string()
+        };
+        cfg.topic = if cfg.topic.trim().is_empty() {
+            "audio2mqtt/transcripts".to_string()
+        } else {
+            cfg.topic.trim().to_string()
+        };
+        cfg.audio_send_topic = if cfg.audio_send_topic.trim().is_empty() {
+            default_mqtt_audio_send_topic()
+        } else {
+            cfg.audio_send_topic.trim().to_string()
+        };
+        cfg.username = normalize_optional_secret(cfg.username.as_deref());
+        cfg.password = normalize_optional_secret(cfg.password.as_deref());
+        cfg.qos = cfg.qos.min(2);
+        cfg
     }
 }
 
@@ -530,12 +570,15 @@ struct TeamSpeakControl {
     status: Arc<RwLock<TeamSpeakStatus>>,
 }
 
-#[derive(Debug)]
 enum TeamSpeakCommand {
     Connect,
     Disconnect,
     Reconnect,
     Apply(TeamSpeakConfig),
+    SendAudio {
+        clip: TeamSpeakAudioClip,
+        reply: Option<oneshot::Sender<Result<TeamSpeakAudioAccepted, String>>>,
+    },
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -674,6 +717,63 @@ struct RestAudioRequest {
     channels: Option<usize>,
 }
 
+#[derive(Debug, Deserialize)]
+struct TeamSpeakAudioSendRequest {
+    audio: RestAudioRequest,
+    context: Option<Value>,
+}
+
+#[derive(Debug)]
+struct DecodedAudio {
+    samples: Vec<f32>,
+    sample_rate: usize,
+    channels: usize,
+    format: String,
+    encoding: String,
+}
+
+#[derive(Debug)]
+struct TeamSpeakAudioClip {
+    id: Uuid,
+    samples_48k_mono: Vec<f32>,
+    original_sample_rate: usize,
+    original_channels: usize,
+    original_format: String,
+    original_encoding: String,
+    duration_sec: f64,
+    context: Option<Value>,
+    source: String,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct TeamSpeakAudioAccepted {
+    ok: bool,
+    id: Uuid,
+    status: String,
+    source: String,
+    context: Option<Value>,
+    teamspeak: TeamSpeakAudioTarget,
+    audio: TeamSpeakAudioAcceptedAudio,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct TeamSpeakAudioTarget {
+    server_address: String,
+    channel_id: Option<u64>,
+    channel_path: String,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct TeamSpeakAudioAcceptedAudio {
+    format: String,
+    encoding: String,
+    sample_rate_original: usize,
+    channels_original: usize,
+    sample_rate: usize,
+    channels: usize,
+    duration_sec: f64,
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
     let initial_log_level = env_or("AUDIO2MQTT_LOG_LEVEL", "info");
@@ -727,6 +827,11 @@ async fn main() -> Result<()> {
         }
     });
 
+    let mqtt_audio_state = shared.clone();
+    tokio::spawn(async move {
+        run_mqtt_teamspeak_audio_listener(mqtt_audio_state).await;
+    });
+
     let audio_env = env.clone();
     let audio_runtime_config = shared.runtime_config.clone();
     thread::Builder::new()
@@ -776,6 +881,11 @@ fn load_or_create_runtime_config(path: &str, env: &EnvConfig) -> Result<RuntimeC
             active_model_id: env.default_model_id.clone(),
             profiles: default_model_profiles(&env.default_model_id, &env.model_path, &env.model_url),
         };
+        changed = true;
+    }
+    let normalized_mqtt = cfg.mqtt.normalized();
+    if serde_json::to_value(&cfg.mqtt)? != serde_json::to_value(&normalized_mqtt)? {
+        cfg.mqtt = normalized_mqtt;
         changed = true;
     }
     cfg.transcription = cfg.transcription.normalized();
@@ -1332,6 +1442,9 @@ async fn run_teamspeak_manager(
                     cfg.enabled = true;
                 }
                 Some(TeamSpeakCommand::Disconnect) => {}
+                Some(TeamSpeakCommand::SendAudio { reply, .. }) => {
+                    reply_teamspeak_audio(reply, Err("TeamSpeak is not connected".to_string()));
+                }
                 None => break,
             }
             update_teamspeak_status(&status, |s| {
@@ -1384,6 +1497,9 @@ async fn run_teamspeak_manager(
                             cfg = runtime_config.read().unwrap().teamspeak.clone().normalized();
                         }
                         Some(TeamSpeakCommand::Disconnect) => cfg.enabled = false,
+                        Some(TeamSpeakCommand::SendAudio { reply, .. }) => {
+                            reply_teamspeak_audio(reply, Err("TeamSpeak is not connected".to_string()));
+                        }
                         None => break,
                     }
                     continue;
@@ -1434,6 +1550,10 @@ async fn run_teamspeak_session(
 
     let logger = slog::Logger::root(slog::Discard, slog::o!());
     let mut audio_handler = tsclientlib::audio::AudioHandler::<ClientId>::new(logger);
+    let mut outgoing_audio = match TeamSpeakOutgoingAudio::new() {
+        Ok(sender) => sender,
+        Err(e) => return TeamSpeakSessionEnd::Fatal(e.to_string()),
+    };
     let mut segmenters: HashMap<ClientId, AudioSegmenter> = HashMap::new();
     let mut speakers: HashMap<ClientId, TeamSpeakSpeakerMeta> = HashMap::new();
     let mut audio_tick = time::interval(Duration::from_millis(20));
@@ -1450,6 +1570,10 @@ async fn run_teamspeak_session(
                     }
                     Some(TeamSpeakCommand::Connect) | Some(TeamSpeakCommand::Reconnect) => {
                         return TeamSpeakSessionEnd::Reconnect;
+                    }
+                    Some(TeamSpeakCommand::SendAudio { clip, reply }) => {
+                        let result = outgoing_audio.enqueue(&con, &status, clip);
+                        reply_teamspeak_audio(reply, result);
                     }
                     None => {
                         return TeamSpeakSessionEnd::Disconnected;
@@ -1488,6 +1612,9 @@ async fn run_teamspeak_session(
                             warn!(client_id = ?client_id, error = %e, "failed to flush TeamSpeak audio segment");
                         }
                     }
+                }
+                if let Err(e) = outgoing_audio.send_next_frame(&mut con) {
+                    warn!(error = %e, "failed to send TeamSpeak audio frame");
                 }
             }
             event = async {
@@ -1576,6 +1703,147 @@ async fn run_teamspeak_session(
     }
 }
 
+struct TeamSpeakOutgoingAudio {
+    encoder: audiopus::coder::Encoder,
+    queue: VecDeque<TeamSpeakAudioClip>,
+    current: Option<TeamSpeakAudioPlayback>,
+    opus_output: [u8; MAX_OPUS_FRAME_SIZE],
+}
+
+struct TeamSpeakAudioPlayback {
+    clip: TeamSpeakAudioClip,
+    cursor: usize,
+    sent_end: bool,
+}
+
+impl TeamSpeakOutgoingAudio {
+    fn new() -> Result<Self> {
+        let encoder = audiopus::coder::Encoder::new(
+            audiopus::SampleRate::Hz48000,
+            audiopus::Channels::Mono,
+            audiopus::Application::Voip,
+        )
+        .map_err(|e| anyhow!("creating TeamSpeak Opus encoder: {e}"))?;
+        Ok(Self {
+            encoder,
+            queue: VecDeque::new(),
+            current: None,
+            opus_output: [0; MAX_OPUS_FRAME_SIZE],
+        })
+    }
+
+    fn enqueue(
+        &mut self,
+        con: &TsConnection,
+        status: &Arc<RwLock<TeamSpeakStatus>>,
+        clip: TeamSpeakAudioClip,
+    ) -> Result<TeamSpeakAudioAccepted, String> {
+        if !con.can_send_audio() {
+            return Err("TeamSpeak client cannot send audio; check mute state, talk power and channel permissions".to_string());
+        }
+        let accepted = teamspeak_audio_accepted(&clip, status);
+        info!(
+            id = %clip.id,
+            duration_sec = clip.duration_sec,
+            queue_len = self.queue.len(),
+            "accepted TeamSpeak audio send"
+        );
+        self.queue.push_back(clip);
+        Ok(accepted)
+    }
+
+    fn send_next_frame(&mut self, con: &mut TsConnection) -> Result<()> {
+        if self.current.is_none() {
+            self.current = self.queue.pop_front().map(|clip| TeamSpeakAudioPlayback {
+                clip,
+                cursor: 0,
+                sent_end: false,
+            });
+            if let Some(playback) = &self.current {
+                info!(id = %playback.clip.id, "starting TeamSpeak audio send");
+            }
+        }
+
+        let Some(playback) = &mut self.current else {
+            return Ok(());
+        };
+
+        if !con.can_send_audio() {
+            return Ok(());
+        }
+
+        if playback.cursor >= playback.clip.samples_48k_mono.len() {
+            if !playback.sent_end {
+                let packet = OutAudio::new(&AudioData::C2S {
+                    id: 0,
+                    codec: CodecType::OpusVoice,
+                    data: &[],
+                });
+                con.send_audio(packet)?;
+                playback.sent_end = true;
+                info!(id = %playback.clip.id, "finished TeamSpeak audio send");
+            }
+            self.current = None;
+            return Ok(());
+        }
+
+        let remaining = playback.clip.samples_48k_mono.len() - playback.cursor;
+        let take = remaining.min(TEAMSPEAK_SEND_FRAME_SAMPLES);
+        let mut frame = [0.0f32; TEAMSPEAK_SEND_FRAME_SAMPLES];
+        frame[..take].copy_from_slice(&playback.clip.samples_48k_mono[playback.cursor..playback.cursor + take]);
+        playback.cursor += take;
+
+        let len = self
+            .encoder
+            .encode_float(&frame, &mut self.opus_output[..])
+            .map_err(|e| anyhow!("encoding TeamSpeak Opus frame: {e}"))?;
+        let packet = OutAudio::new(&AudioData::C2S {
+            id: 0,
+            codec: CodecType::OpusVoice,
+            data: &self.opus_output[..len],
+        });
+        con.send_audio(packet)?;
+        Ok(())
+    }
+}
+
+fn reply_teamspeak_audio(
+    reply: Option<oneshot::Sender<Result<TeamSpeakAudioAccepted, String>>>,
+    result: Result<TeamSpeakAudioAccepted, String>,
+) {
+    if let Some(reply) = reply {
+        let _ = reply.send(result);
+    }
+}
+
+fn teamspeak_audio_accepted(
+    clip: &TeamSpeakAudioClip,
+    status: &Arc<RwLock<TeamSpeakStatus>>,
+) -> TeamSpeakAudioAccepted {
+    let status = status.read().unwrap();
+    TeamSpeakAudioAccepted {
+        ok: true,
+        id: clip.id,
+        status: "accepted".to_string(),
+        source: clip.source.clone(),
+        context: clip.context.clone(),
+        teamspeak: TeamSpeakAudioTarget {
+            server_address: status.server_address.clone(),
+            channel_id: status.active_channel_id,
+            channel_path: status.active_channel_path.clone(),
+        },
+        audio: TeamSpeakAudioAcceptedAudio {
+            format: clip.original_format.clone(),
+            encoding: clip.original_encoding.clone(),
+            sample_rate_original: clip.original_sample_rate,
+            channels_original: clip.original_channels,
+            sample_rate: TEAMSPEAK_SAMPLE_RATE,
+            channels: 1,
+            duration_sec: clip.duration_sec,
+        },
+    }
+}
+
 fn connect_teamspeak(cfg: &TeamSpeakConfig) -> Result<TsConnection> {
     let primary = if let Some(channel_id) = cfg.channel_id {
         Some(TeamSpeakConnectChannel::Id(channel_id))
@@ -1619,7 +1887,7 @@ fn build_teamspeak_connect_options(
     let mut options = TsConnection::build(cfg.server_address.clone())
         .name(cfg.nickname.clone())
         .identity(identity)
-        .input_muted(true)
+        .input_muted(false)
         .output_muted(false);
     if let Some(password) = &cfg.server_password {
         options = options.password(password.clone());
@@ -1929,6 +2197,7 @@ async fn send_webhooks(state: &SharedState, hooks: &[WebhookConfig], payload: St
 }
 
 async fn publish_mqtt(_state: &SharedState, cfg: &MqttConfig, payload: String) -> Result<()> {
+    let cfg = cfg.normalized();
     if !cfg.enabled {
         return Ok(());
     }
@@ -1948,11 +2217,7 @@ async fn publish_mqtt(_state: &SharedState, cfg: &MqttConfig, payload: String) -
     }
 
     let (client, mut eventloop): (AsyncClient, EventLoop) = AsyncClient::new(options, 10);
-    let qos = match cfg.qos {
-        0 => QoS::AtMostOnce,
-        2 => QoS::ExactlyOnce,
-        _ => QoS::AtLeastOnce,
-    };
+    let qos = mqtt_qos(cfg.qos);
 
     client.publish(cfg.topic.clone(), qos, false, payload).await?;
 
@@ -1965,6 +2230,140 @@ async fn publish_mqtt(_state: &SharedState, cfg: &MqttConfig, payload: String) -
     .await;
 
     Ok(())
+}
+
+#[derive(Debug, Clone, PartialEq)]
+struct MqttAudioListenerConfig {
+    host: String,
+    port: u16,
+    username: Option<String>,
+    password: Option<String>,
+    client_id: String,
+    topic: String,
+    qos: u8,
+}
+
+impl MqttAudioListenerConfig {
+    fn from_mqtt(cfg: &MqttConfig) -> Option<Self> {
+        let cfg = cfg.normalized();
+        if !cfg.enabled {
+            return None;
+        }
+        let topic = cfg.audio_send_topic.trim().to_string();
+        if topic.is_empty() {
+            return None;
+        }
+        Some(Self {
+            host: cfg.host,
+            port: cfg.port,
+            username: cfg.username,
+            password: cfg.password,
+            client_id: format!("{}-teamspeak-audio-in", cfg.client_id),
+            topic,
+            qos: cfg.qos,
+        })
+    }
+}
+
+async fn run_mqtt_teamspeak_audio_listener(state: SharedState) {
+    loop {
+        let listener_cfg = {
+            let cfg = state.runtime_config.read().unwrap();
+            MqttAudioListenerConfig::from_mqtt(&cfg.mqtt)
+        };
+        let Some(listener_cfg) = listener_cfg else {
+            time::sleep(Duration::from_secs(5)).await;
+            continue;
+        };
+
+        if let Err(e) = run_mqtt_teamspeak_audio_subscription(state.clone(), listener_cfg).await {
+            warn!(error = %e, "MQTT TeamSpeak audio listener stopped");
+            time::sleep(Duration::from_secs(5)).await;
+        }
+    }
+}
+
+async fn run_mqtt_teamspeak_audio_subscription(
+    state: SharedState,
+    listener_cfg: MqttAudioListenerConfig,
+) -> Result<()> {
+    let mut options = MqttOptions::new(
+        listener_cfg.client_id.clone(),
+        listener_cfg.host.clone(),
+        listener_cfg.port,
+    );
+    options.set_keep_alive(Duration::from_secs(10));
+    if let Some(username) = &listener_cfg.username {
+        if !username.trim().is_empty() {
+            options.set_credentials(username, listener_cfg.password.clone().unwrap_or_default());
+        }
+    }
+
+    let (client, mut eventloop): (AsyncClient, EventLoop) = AsyncClient::new(options, 10);
+    client
+        .subscribe(listener_cfg.topic.clone(), mqtt_qos(listener_cfg.qos))
+        .await?;
+    info!(topic = %listener_cfg.topic, "MQTT TeamSpeak audio listener subscribed");
+
+    let mut config_check = time::interval(Duration::from_secs(5));
+    loop {
+        tokio::select! {
+            _ = config_check.tick() => {
+                let current = {
+                    let cfg = state.runtime_config.read().unwrap();
+                    MqttAudioListenerConfig::from_mqtt(&cfg.mqtt)
+                };
+                if current.as_ref() != Some(&listener_cfg) {
+                    info!("MQTT TeamSpeak audio listener configuration changed");
+                    return Ok(());
+                }
+            }
+            event = eventloop.poll() => {
+                match event? {
+                    MqttEvent::Incoming(MqttPacket::Publish(publish)) => {
+                        if publish.topic == listener_cfg.topic {
+                            handle_mqtt_teamspeak_audio_message(&state, &listener_cfg.topic, &publish.payload).await;
+                        }
+                    }
+                    _ => {}
+                }
+            }
+        }
+    }
+}
+
+async fn handle_mqtt_teamspeak_audio_message(state: &SharedState, topic: &str, payload: &[u8]) {
+    let req = match serde_json::from_slice::<TeamSpeakAudioSendRequest>(payload) {
+        Ok(req) => req,
+        Err(e) => {
+            warn!(topic = %topic, error = %e, "invalid MQTT TeamSpeak audio JSON");
+            return;
+        }
+    };
+    let source = format!("mqtt:{topic}");
+    let clip = match build_teamspeak_audio_clip(&req.audio, req.context, source) {
+        Ok(clip) => clip,
+        Err(e) => {
+            warn!(topic = %topic, error = %e, "invalid MQTT TeamSpeak audio payload");
+            return;
+        }
+    };
+    match submit_teamspeak_audio(state, clip).await {
+        Ok(accepted) => {
+            info!(topic = %topic, id = %accepted.id, "accepted MQTT TeamSpeak audio message");
+        }
+        Err(e) => {
+            warn!(topic = %topic, error = %e, "rejected MQTT TeamSpeak audio message");
+        }
+    }
+}
+
+fn mqtt_qos(qos: u8) -> QoS {
+    match qos {
+        0 => QoS::AtMostOnce,
+        2 => QoS::ExactlyOnce,
+        _ => QoS::AtLeastOnce,
+    }
 }
 
 async fn run_web_admin(state: SharedState) -> Result<()> {
@@ -1981,6 +2380,7 @@ async fn run_web_admin(state: SharedState) -> Result<()> {
         .route("/api/teamspeak/disconnect", post(teamspeak_disconnect))
         .route("/api/teamspeak/reconnect", post(teamspeak_reconnect))
         .route("/api/teamspeak/channel", post(teamspeak_select_channel))
+        .route("/api/teamspeak/audio", post(rest_teamspeak_audio))
         .route("/api/test/webhook", post(test_webhook))
         .route("/api/test/mqtt", post(test_mqtt))
         .route("/api/transcribe", post(rest_transcribe))
@@ -2115,7 +2515,56 @@ async fn teamspeak_select_channel(
     }))
 }
 
+async fn rest_teamspeak_audio(
+    ConnectInfo(addr): ConnectInfo<SocketAddr>,
+    State(state): State<SharedState>,
+    Json(req): Json<TeamSpeakAudioSendRequest>,
+) -> impl IntoResponse {
+    let source = addr.to_string();
+    let clip = match build_teamspeak_audio_clip(&req.audio, req.context, source) {
+        Ok(clip) => clip,
+        Err(e) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(json!({"ok": false, "error": e.to_string()})),
+            );
+        }
+    };
+
+    match submit_teamspeak_audio(&state, clip).await {
+        Ok(accepted) => (StatusCode::ACCEPTED, Json(json!(accepted))),
+        Err(e) => (StatusCode::CONFLICT, Json(json!({"ok": false, "error": e}))),
+    }
+}
+
+async fn submit_teamspeak_audio(
+    state: &SharedState,
+    clip: TeamSpeakAudioClip,
+) -> Result<TeamSpeakAudioAccepted, String> {
+    let status = state.teamspeak.status.read().unwrap().clone();
+    if !status.connected {
+        return Err("TeamSpeak is not connected".to_string());
+    }
+
+    let (tx, rx) = oneshot::channel();
+    state
+        .teamspeak
+        .tx
+        .send(TeamSpeakCommand::SendAudio {
+            clip,
+            reply: Some(tx),
+        })
+        .map_err(|_| "TeamSpeak command channel is unavailable".to_string())?;
+
+    match tokio::time::timeout(Duration::from_secs(5), rx).await {
+        Ok(Ok(result)) => result,
+        Ok(Err(e)) => Err(format!("TeamSpeak audio response channel closed: {e}")),
+        Err(_) => Err("TeamSpeak audio acceptance timed out".to_string()),
+    }
+}
+
 fn normalize_runtime_config(cfg: &mut RuntimeConfig, env: &EnvConfig) {
+    cfg.mqtt = cfg.mqtt.normalized();
     cfg.transcription = cfg.transcription.normalized();
     cfg.teamspeak = cfg.teamspeak.normalized();
     if cfg.models.profiles.is_empty() {
@@ -2635,7 +3084,54 @@ async fn rest_transcribe(
     }
 }
 
+fn build_teamspeak_audio_clip(
+    audio: &RestAudioRequest,
+    context: Option<Value>,
+    source: String,
+) -> Result<TeamSpeakAudioClip> {
+    let decoded = decode_audio_request(audio)?;
+    if decoded.samples.is_empty() {
+        return Err(anyhow!("audio.data contains no samples"));
+    }
+    let samples_48k_mono = resample_mono_linear(&decoded.samples, decoded.sample_rate, TEAMSPEAK_SAMPLE_RATE)?;
+    if samples_48k_mono.is_empty() {
+        return Err(anyhow!("resampled audio contains no samples"));
+    }
+    let duration_sec = decoded.samples.len() as f64 / decoded.sample_rate as f64;
+    Ok(TeamSpeakAudioClip {
+        id: Uuid::new_v4(),
+        samples_48k_mono,
+        original_sample_rate: decoded.sample_rate,
+        original_channels: decoded.channels,
+        original_format: decoded.format,
+        original_encoding: decoded.encoding,
+        duration_sec: round3(duration_sec),
+        context,
+        source,
+    })
+}
+
 fn decode_rest_audio(audio: &RestAudioRequest) -> Result<(Vec<f32>, usize, usize, String, String)> {
+    let decoded = decode_audio_request(audio)?;
+    if decoded.sample_rate != SAMPLE_RATE {
+        return Err(anyhow!(
+            "unsupported sample_rate {}; expected {SAMPLE_RATE}",
+            decoded.sample_rate
+        ));
+    }
+    if decoded.format == "pcm_s16le" && decoded.channels != 1 {
+        return Err(anyhow!("unsupported channels {}; expected 1", decoded.channels));
+    }
+    Ok((
+        decoded.samples,
+        decoded.sample_rate,
+        decoded.channels,
+        decoded.format,
+        decoded.encoding,
+    ))
+}
+
+fn decode_audio_request(audio: &RestAudioRequest) -> Result<DecodedAudio> {
     let format = audio.format.trim().to_lowercase();
     let encoding = audio.encoding.trim().to_lowercase();
     if encoding != "base64" {
@@ -2649,34 +3145,58 @@ fn decode_rest_audio(audio: &RestAudioRequest) -> Result<(Vec<f32>, usize, usize
         "pcm_s16le" | "s16le" => {
             let sample_rate = audio.sample_rate.unwrap_or(SAMPLE_RATE);
             let channels = audio.channels.unwrap_or(1);
-            if sample_rate != SAMPLE_RATE {
-                return Err(anyhow!("unsupported sample_rate {sample_rate}; expected {SAMPLE_RATE}"));
-            }
-            if channels != 1 {
-                return Err(anyhow!("unsupported channels {channels}; expected 1"));
-            }
-            if bytes.len() % 2 != 0 {
-                return Err(anyhow!("pcm_s16le byte length must be divisible by 2"));
-            }
-            let samples = bytes
-                .chunks_exact(2)
-                .map(|b| i16::from_le_bytes([b[0], b[1]]) as f32 / 32768.0)
-                .collect::<Vec<f32>>();
-            Ok((samples, sample_rate, channels, "pcm_s16le".to_string(), encoding))
+            let samples = decode_pcm_s16le_mono(&bytes, channels)?;
+            Ok(DecodedAudio {
+                samples,
+                sample_rate,
+                channels,
+                format: "pcm_s16le".to_string(),
+                encoding,
+            })
         }
-        "wav" => decode_wav_bytes(&bytes, encoding),
+        "wav" => decode_wav_bytes(&bytes, encoding, audio.sample_rate, audio.channels),
         other => Err(anyhow!("unsupported audio.format '{other}'; expected 'wav' or 'pcm_s16le'")),
     }
 }
 
-fn decode_wav_bytes(bytes: &[u8], encoding: String) -> Result<(Vec<f32>, usize, usize, String, String)> {
+fn decode_pcm_s16le_mono(bytes: &[u8], channels: usize) -> Result<Vec<f32>> {
+    if channels == 0 {
+        return Err(anyhow!("channels must be at least 1"));
+    }
+    if bytes.len() % 2 != 0 {
+        return Err(anyhow!("pcm_s16le byte length must be divisible by 2"));
+    }
+    let raw = bytes
+        .chunks_exact(2)
+        .map(|b| i16::from_le_bytes([b[0], b[1]]))
+        .collect::<Vec<i16>>();
+    downmix_i16_to_mono(&raw, channels)
+}
+
+fn decode_wav_bytes(
+    bytes: &[u8],
+    encoding: String,
+    expected_sample_rate: Option<usize>,
+    expected_channels: Option<usize>,
+) -> Result<DecodedAudio> {
     let cursor = Cursor::new(bytes.to_vec());
     let mut reader = hound::WavReader::new(cursor).context("reading WAV data")?;
     let spec = reader.spec();
     let sample_rate = spec.sample_rate as usize;
     let channels = spec.channels as usize;
-    if sample_rate != SAMPLE_RATE {
-        return Err(anyhow!("unsupported WAV sample_rate {sample_rate}; expected {SAMPLE_RATE}"));
+    if let Some(expected) = expected_sample_rate {
+        if expected != sample_rate {
+            return Err(anyhow!(
+                "WAV sample_rate {sample_rate} does not match audio.sample_rate {expected}"
+            ));
+        }
+    }
+    if let Some(expected) = expected_channels {
+        if expected != channels {
+            return Err(anyhow!(
+                "WAV channels {channels} does not match audio.channels {expected}"
+            ));
+        }
     }
     if channels == 0 {
         return Err(anyhow!("WAV channels must be at least 1"));
@@ -2694,18 +3214,56 @@ fn decode_wav_bytes(bytes: &[u8], encoding: String) -> Result<(Vec<f32>, usize, 
         .collect::<std::result::Result<Vec<i16>, _>>()
         .context("reading WAV samples")?;
 
-    let samples = if channels == 1 {
-        raw.iter().map(|s| *s as f32 / 32768.0).collect::<Vec<f32>>()
-    } else {
-        raw.chunks(channels)
-            .map(|frame| {
-                let sum: i32 = frame.iter().map(|s| *s as i32).sum();
-                (sum as f32 / frame.len() as f32) / 32768.0
-            })
-            .collect::<Vec<f32>>()
-    };
+    let samples = downmix_i16_to_mono(&raw, channels)?;
+    Ok(DecodedAudio {
+        samples,
+        sample_rate,
+        channels,
+        format: "wav".to_string(),
+        encoding,
+    })
+}
 
-    Ok((samples, sample_rate, channels, "wav".to_string(), encoding))
+fn downmix_i16_to_mono(raw: &[i16], channels: usize) -> Result<Vec<f32>> {
+    if channels == 0 {
+        return Err(anyhow!("channels must be at least 1"));
+    }
+    if raw.len() % channels != 0 {
+        return Err(anyhow!("audio sample count must be divisible by channels"));
+    }
+    if channels == 1 {
+        return Ok(raw.iter().map(|s| *s as f32 / 32768.0).collect());
+    }
+    Ok(raw
+        .chunks_exact(channels)
+        .map(|frame| {
+            let sum: i32 = frame.iter().map(|s| *s as i32).sum();
+            (sum as f32 / frame.len() as f32) / 32768.0
+        })
+        .collect())
+}
+
+fn resample_mono_linear(samples: &[f32], from_rate: usize, to_rate: usize) -> Result<Vec<f32>> {
+    if from_rate == 0 || to_rate == 0 {
+        return Err(anyhow!("sample_rate must be greater than zero"));
+    }
+    if samples.is_empty() || from_rate == to_rate {
+        return Ok(samples.to_vec());
+    }
+    let out_len = ((samples.len() as f64 * to_rate as f64) / from_rate as f64)
+        .round()
+        .max(1.0) as usize;
+    let ratio = from_rate as f64 / to_rate as f64;
+    let mut out = Vec::with_capacity(out_len);
+    for i in 0..out_len {
+        let pos = i as f64 * ratio;
+        let idx = pos.floor() as usize;
+        let frac = (pos - idx as f64) as f32;
+        let a = samples.get(idx).copied().unwrap_or_else(|| *samples.last().unwrap());
+        let b = samples.get(idx + 1).copied().unwrap_or(a);
+        out.push(a + (b - a) * frac);
+    }
+    Ok(out)
 }
 
 async fn events_sse(

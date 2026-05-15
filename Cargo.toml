@@ -5,6 +5,7 @@ edition = "2021"
 
 [dependencies]
 anyhow = "1.0"
+audiopus = "0.2"
 base64 = "0.22"
 axum = { version = "0.7", features = ["json", "macros"] }
 chrono = { version = "0.4", features = ["serde"] }

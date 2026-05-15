@@ -94,7 +94,7 @@ You can configure:
 - logging level
 - frame-level VAD debug on/off
 - MQTT enabled/disabled
-- MQTT host, port, topic, username, password and QoS
+- MQTT host, port, transcript topic, TeamSpeak audio send topic, username, password and QoS
 - TeamSpeak receiver enabled/disabled
 - TeamSpeak server, nickname, identity and channel selection
 - webhook endpoints
@@ -183,6 +183,42 @@ pcm_s16le: 16 kHz mono signed 16-bit little-endian PCM.
 
 REST responses use the same transcript schema as stream events.
 
+## TeamSpeak audio output
+
+Endpoint:
+
+```http
+POST /api/teamspeak/audio
+Content-Type: application/json
+```
+
+MQTT input topic by default:
+
+```text
+audio2mqtt/teamspeak/audio/send
+```
+
+Request body for REST and MQTT:
+
+```json
+{
+  "audio": {
+    "format": "pcm_s16le",
+    "encoding": "base64",
+    "sample_rate": 16000,
+    "channels": 1,
+    "data": "..."
+  },
+  "context": {
+    "source_system": "tts"
+  }
+}
+```
+
+Supported formats are base64 `wav` and base64 raw `pcm_s16le`. Include `sample_rate` and `channels` in the audio package; WAV metadata is validated against those fields when they are present. The service downmixes to mono and resamples to TeamSpeak's 48 kHz Opus Voice stream internally.
+
+The REST endpoint returns as soon as the audio is accepted into the TeamSpeak send queue. If the TeamSpeak bot is not connected or cannot speak in the channel, the request returns an error.
+
 ## TeamSpeak input
 
 The TeamSpeak receiver connects as a normal client to an external TeamSpeak server. It does not implement or run a TeamSpeak server.
@@ -247,7 +283,8 @@ If your MQTT broker runs on the Windows host, use this in the web UI:
 ```text
 host: host.docker.internal
 port: 1883
-topic: audio2mqtt/transcripts
+transcript topic: audio2mqtt/transcripts
+TeamSpeak audio send topic: audio2mqtt/teamspeak/audio/send
 ```
 
 If the broker is elsewhere on the network, use its IP or DNS name.

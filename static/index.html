@@ -93,9 +93,10 @@
     <div class="small">Keep VAD debug disabled unless you are tuning the VAD. It logs a line for every 512-sample VAD frame.</div>
 
     <h3>MQTT</h3>
-    <label><input id="mqttEnabled" type="checkbox" style="width:auto"> Enable MQTT publishing</label>
+    <label><input id="mqttEnabled" type="checkbox" style="width:auto"> Enable MQTT</label>
     <label>Host</label><input id="mqttHost" />
-    <div class="row"><div><label>Topic</label><input id="mqttTopic" /></div><div><label>Port</label><input id="mqttPort" type="number" /></div></div>
+    <div class="row"><div><label>Transcript topic</label><input id="mqttTopic" /></div><div><label>Port</label><input id="mqttPort" type="number" /></div></div>
+    <label>TeamSpeak audio send topic</label><input id="mqttAudioSendTopic" />
     <div class="row"><div><label>Username</label><input id="mqttUsername" /></div><div><label>QoS</label><select id="mqttQos"><option>0</option><option selected>1</option><option>2</option></select></div></div>
     <label>Password</label><input id="mqttPassword" type="password" />
     <label>Client ID</label><input id="mqttClientId" />
@@ -126,6 +127,20 @@
   "context": {
     "device_id": "frontdesk-mic-01",
     "session_id": "abc-789"
+  }
+}</pre>
+    <h3>TeamSpeak audio send</h3>
+    <div class="small">Endpoint: <code>POST /api/teamspeak/audio</code> or MQTT topic <code>audio2mqtt/teamspeak/audio/send</code>. Send base64 WAV or raw <code>pcm_s16le</code> with sample rate and channels.</div>
+    <pre>{
+  "audio": {
+    "format": "pcm_s16le",
+    "encoding": "base64",
+    "sample_rate": 16000,
+    "channels": 1,
+    "data": "..."
+  },
+  "context": {
+    "source_system": "tts"
   }
 }</pre>
   </section>
@@ -219,6 +234,7 @@ async function loadConfig() {
   document.getElementById('mqttHost').value = cfg.mqtt.host || '';
   document.getElementById('mqttPort').value = cfg.mqtt.port || 1883;
   document.getElementById('mqttTopic').value = cfg.mqtt.topic || 'audio2mqtt/transcripts';
+  document.getElementById('mqttAudioSendTopic').value = cfg.mqtt.audio_send_topic || 'audio2mqtt/teamspeak/audio/send';
   document.getElementById('mqttUsername').value = cfg.mqtt.username || '';
   document.getElementById('mqttPassword').value = cfg.mqtt.password || '';
   document.getElementById('mqttClientId').value = cfg.mqtt.client_id || 'audio2mqtt';
@@ -283,6 +299,7 @@ function readConfigFromForm() {
       password: document.getElementById('mqttPassword').value || null,
       client_id: document.getElementById('mqttClientId').value || 'audio2mqtt',
       topic: document.getElementById('mqttTopic').value || 'audio2mqtt/transcripts',
+      audio_send_topic: document.getElementById('mqttAudioSendTopic').value || 'audio2mqtt/teamspeak/audio/send',
       qos: Number(document.getElementById('mqttQos').value || 1)
     },
     webhooks: hooks,
